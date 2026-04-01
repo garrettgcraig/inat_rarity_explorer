@@ -1,0 +1,25 @@
+Package: inat-rarity-explorer
+Title: iNaturalist Rarity Explorer — Shiny App
+Version: 1.0.0
+Date: 2026-04-01
+Author: Garrett Craig <garrettgcraig@gmail.com>
+Description: A Shiny dashboard that fetches a user's research-grade
+    iNaturalist observations and ranks them by global observation count,
+    surfacing the species they have observed that fewest others have recorded.
+License: MIT
+Encoding: UTF-8
+
+Imports:
+    shiny (>= 1.8.0),
+    shinydashboard (>= 0.7.2),
+    shinyjs (>= 2.1.0),
+    shinycssloaders (>= 1.0.0),
+    httr (>= 1.4.0),
+    jsonlite (>= 1.8.0),
+    plotly (>= 4.10.0),
+    DT (>= 0.28),
+    dplyr (>= 1.1.0)
+
+SystemRequirements: R (>= 4.2.0), internet access to api.inaturalist.org
+URL: https://github.com/garrettgcraig/inat-rarity-explorer
+BugReports: https://github.com/garrettgcraig/inat-rarity-explorer/issues
