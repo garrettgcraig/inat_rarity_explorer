@@ -461,12 +461,15 @@ server <- function(input, output, session) {
   fs <- new.env()
   fs$generation <- 0L  # incremented each fetch; stale callbacks check & exit
 
-  # Schedule the next step on the event loop. Wrapped so we can swallow any
-  # error in a callback (otherwise later() callbacks die silently).
+  # Schedule the next step on the event loop. later() callbacks run outside
+  # any reactive context, so wrap in withReactiveDomain(session) — otherwise
+  # shinyjs::enable/disable can't find the session and the app dies.
   schedule <- function(fn, delay = 0.05, gen = fs$generation) {
     later::later(function() {
       if (gen != fs$generation) return()  # superseded — abort
-      tryCatch(fn(), error = function(e) finish_error(conditionMessage(e)))
+      shiny::withReactiveDomain(session, {
+        tryCatch(fn(), error = function(e) finish_error(conditionMessage(e)))
+      })
     }, delay)
   }
 
