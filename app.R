@@ -13,6 +13,7 @@ library(jsonlite)
 library(plotly)
 library(DT)
 library(dplyr)
+library(later)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 BASE_URL      <- "https://api.inaturalist.org/v1"
@@ -294,6 +295,19 @@ dark_css <- sprintf('
     padding: 11px 16px; border-radius: 6px; margin: 8px 0; font-size: 14px;
   }
 
+  /* Modal */
+  .modal-content {
+    background-color: #172030 !important;
+    border: 1px solid #233040 !important;
+    color: #dde0e4 !important;
+  }
+  .modal-header, .modal-footer {
+    border-color: #233040 !important;
+  }
+  .modal-title { color: %1$s !important; }
+  .modal-body { color: #dde0e4 !important; }
+  .modal-backdrop.in { opacity: 0.7 !important; }
+
   /* Welcome */
   .welcome-box {
     text-align: center; padding: 60px 30px; color: #6a8090;
@@ -431,7 +445,218 @@ server <- function(input, output, session) {
     error_msg     = ""
   )
 
-  # ── Fetch ──────────────────────────────────────────────────────────────────
+  # ── Fetch state machine ───────────────────────────────────────────────────
+  #
+  # Why a state machine: shinyapps.io's WebSocket disconnects if the R thread
+  # is blocked for too long. Multi-process async (future) blows past the
+  # 1 GB free-tier memory limit. Solution: keep everything in one R process,
+  # but break the long fetch into tiny steps scheduled with later::later() —
+  # control returns to Shiny's event loop between steps, so heartbeats flow
+  # and memory stays modest.
+  #
+  # fs is a plain environment (not reactiveValues) — its fields are mutated
+  # from later() callbacks where reactive contexts aren't available. Only
+  # rv$* writes drive UI updates.
+  fs <- new.env()
+  fs$generation <- 0L  # incremented each fetch; stale callbacks check & exit
+
+  # Schedule the next step on the event loop. Wrapped so we can swallow any
+  # error in a callback (otherwise later() callbacks die silently).
+  schedule <- function(fn, delay = 0.05, gen = fs$generation) {
+    later::later(function() {
+      if (gen != fs$generation) return()  # superseded — abort
+      tryCatch(fn(), error = function(e) finish_error(conditionMessage(e)))
+    }, delay)
+  }
+
+  finish_error <- function(msg) {
+    rv$status    <- "error"
+    rv$error_msg <- msg
+    fs$obs_list  <- NULL
+    fs$obs_df    <- NULL
+    fs$taxa_df   <- NULL
+    fs$counts    <- NULL
+    fs$batches   <- NULL
+    enable("fetch_btn"); enable("username")
+  }
+
+  # ── Stage handlers ────────────────────────────────────────────────────────
+  step_verify <- function() {
+    ok <- tryCatch(check_user_exists(fs$username), error = function(e) FALSE)
+    if (!ok) {
+      finish_error(sprintf(
+        "User '%s' was not found on iNaturalist. Check the spelling and try again.",
+        fs$username))
+      return()
+    }
+    rv$status_msg <- "Counting observations..."
+    schedule(step_count)
+  }
+
+  step_count <- function() {
+    q <- list(user_login = fs$username, per_page = 0)
+    if (fs$qg != "any") q$quality_grade <- fs$qg
+    resp <- safe_get(paste0(BASE_URL, "/observations"), q)
+    if (is.null(resp)) {
+      finish_error("Could not connect to the iNaturalist API.")
+      return()
+    }
+    total <- as.integer(parse_resp(resp)$total_results %||% 0)
+    if (total == 0) {
+      finish_error(sprintf(
+        "No %sobservations found for '%s'.",
+        if (fs$qg == "research") "research-grade " else "", fs$username))
+      return()
+    }
+    fs$total_obs   <- total
+    fs$needs_chunk <- total > 10000
+    fs$per_page    <- 200
+    fs$obs_list    <- list()
+
+    if (fs$needs_chunk) {
+      fs$cur_year <- 2007L
+      fs$end_year <- as.integer(format(Sys.Date(), "%Y"))
+      rv$status_msg <- sprintf(
+        "Fetching %s observations year by year (account is prolific)...",
+        format(total, big.mark = ","))
+      schedule(step_fetch_year_start)
+    } else {
+      fs$d1 <- NULL; fs$d2 <- NULL
+      fs$cur_page <- 1L
+      fs$n_pages  <- ceiling(min(total, 10000) / fs$per_page)
+      rv$status_msg <- sprintf("Fetching %s observations...",
+                               format(total, big.mark = ","))
+      schedule(step_fetch_page)
+    }
+  }
+
+  step_fetch_year_start <- function() {
+    if (fs$cur_year > fs$end_year) {
+      schedule(step_parse)
+      return()
+    }
+    fs$d1 <- sprintf("%d-01-01", fs$cur_year)
+    fs$d2 <- sprintf("%d-12-31", fs$cur_year)
+    q <- list(user_login = fs$username, per_page = 0,
+              d1 = fs$d1, d2 = fs$d2)
+    if (fs$qg != "any") q$quality_grade <- fs$qg
+    resp <- safe_get(paste0(BASE_URL, "/observations"), q)
+    yr_total <- if (!is.null(resp))
+      as.integer(parse_resp(resp)$total_results %||% 0) else 0L
+    if (yr_total == 0) {
+      fs$cur_year <- fs$cur_year + 1L
+      schedule(step_fetch_year_start)
+      return()
+    }
+    fs$cur_page <- 1L
+    fs$n_pages  <- ceiling(min(yr_total, 10000) / fs$per_page)
+    schedule(step_fetch_page)
+  }
+
+  step_fetch_page <- function() {
+    page <- fetch_obs_page(fs$username, page = fs$cur_page,
+                           per_page = fs$per_page,
+                           d1 = fs$d1, d2 = fs$d2,
+                           quality_grade = fs$qg)
+    if (!is.null(page) && length(page$results) > 0)
+      fs$obs_list <- c(fs$obs_list, page$results)
+
+    rv$status_msg <- sprintf("Fetched %s / %s observations...",
+                             format(length(fs$obs_list), big.mark = ","),
+                             format(fs$total_obs, big.mark = ","))
+
+    if (fs$cur_page < fs$n_pages) {
+      fs$cur_page <- fs$cur_page + 1L
+      schedule(step_fetch_page, delay = 0.08)
+    } else if (fs$needs_chunk) {
+      fs$cur_year <- fs$cur_year + 1L
+      schedule(step_fetch_year_start, delay = 0.2)
+    } else {
+      schedule(step_parse)
+    }
+  }
+
+  step_parse <- function() {
+    rv$status_msg <- "Parsing observations..."
+    if (length(fs$obs_list) == 0) {
+      finish_error(sprintf("No observations found for '%s'.", fs$username))
+      return()
+    }
+    fs$obs_df   <- obs_list_to_df(fs$obs_list)
+    fs$obs_list <- NULL  # free memory
+    if (nrow(fs$obs_df) == 0) {
+      finish_error("Could not parse any observations from the API response.")
+      return()
+    }
+    rv$n_total_obs <- nrow(fs$obs_df)
+    schedule(step_summarise)
+  }
+
+  step_summarise <- function() {
+    rv$status_msg <- "Summarising unique taxa..."
+    oc <- fs$obs_df %>% count(taxon_id, name = "n_user_obs")
+    fs$taxa_df <- fs$obs_df %>%
+      group_by(taxon_id) %>% slice(1) %>% ungroup() %>%
+      left_join(oc, by = "taxon_id")
+    fs$obs_df <- NULL  # free memory
+    rv$n_taxa <- nrow(fs$taxa_df)
+    ids <- as.character(unique(fs$taxa_df$taxon_id))
+    fs$batches   <- split(ids, ceiling(seq_along(ids) / 30))
+    fs$n_batches <- length(fs$batches)
+    fs$cur_batch <- 1L
+    fs$counts    <- setNames(rep(NA_integer_, length(ids)), ids)
+    rv$status_msg <- sprintf(
+      "Looking up global counts for %s taxa in %d batches...",
+      format(rv$n_taxa, big.mark = ","), fs$n_batches)
+    schedule(step_lookup)
+  }
+
+  step_lookup <- function() {
+    if (fs$cur_batch > fs$n_batches) {
+      schedule(step_rank)
+      return()
+    }
+    batch <- fs$batches[[fs$cur_batch]]
+    resp <- safe_get(paste0(BASE_URL, "/taxa"),
+                     list(id = paste(batch, collapse = ","), per_page = 30))
+    parsed <- parse_resp(resp)
+    if (!is.null(parsed) && length(parsed$results) > 0) {
+      for (taxon in parsed$results) {
+        tid <- as.character(taxon$id)
+        if (tid %in% names(fs$counts))
+          fs$counts[tid] <- as.integer(taxon$observations_count %||% NA_integer_)
+      }
+    }
+    rv$status_msg <- sprintf("Looking up global counts — batch %d / %d",
+                             fs$cur_batch, fs$n_batches)
+    fs$cur_batch <- fs$cur_batch + 1L
+    schedule(step_lookup, delay = 0.1)
+  }
+
+  step_rank <- function() {
+    rv$status_msg <- "Ranking by rarity..."
+    fs$taxa_df$global_count <- fs$counts[as.character(fs$taxa_df$taxon_id)]
+    rarity_df <- fs$taxa_df %>%
+      filter(!is.na(global_count)) %>%
+      arrange(global_count) %>%
+      mutate(rank = row_number())
+
+    rv$rarity_df  <- rarity_df
+    rv$username   <- fs$username
+    rv$status     <- "done"
+    r1 <- rarity_df
+    rv$status_msg <- sprintf(
+      "✅ Done! %s observations · %s unique taxa ranked · rarest: %s (%s global obs)",
+      format(rv$n_total_obs, big.mark = ","),
+      format(nrow(r1), big.mark = ","),
+      coalesce(r1$common_name[1], r1$sci_name[1], "Unknown"),
+      format(r1$global_count[1], big.mark = ","))
+
+    fs$taxa_df <- NULL; fs$counts <- NULL; fs$batches <- NULL
+    enable("fetch_btn"); enable("username")
+  }
+
+  # ── Kick off ─────────────────────────────────────────────────────────────
   observeEvent(input$fetch_btn, {
 
     username <- trimws(input$username)
@@ -440,7 +665,7 @@ server <- function(input, output, session) {
       return()
     }
 
-    qg <- input$quality_grade  # snapshot at click time
+    qg <- input$quality_grade
 
     # Reset cached data
     rv$rarity_df     <- NULL
@@ -448,187 +673,20 @@ server <- function(input, output, session) {
     rv$status        <- "fetching"
     rv$status_msg    <- paste0("Connecting to iNaturalist for: ", username, " ...")
 
-    disable("fetch_btn")
-    disable("username")
+    fs$generation <- fs$generation + 1L
+    fs$username   <- username
+    fs$qg         <- qg
+    fs$obs_list   <- NULL
+    fs$obs_df     <- NULL
+    fs$taxa_df    <- NULL
+    fs$counts     <- NULL
+    fs$batches    <- NULL
 
-    withProgress(message = "Working...", value = 0, {
+    disable("fetch_btn"); disable("username")
 
-      # ── 1. Verify user ──────────────────────────────────────────────────────
-      setProgress(0.02, detail = "Checking username...")
-
-      user_ok <- tryCatch(check_user_exists(username), error = function(e) FALSE)
-
-      if (!user_ok) {
-        rv$status    <- "error"
-        rv$error_msg <- sprintf(
-          "User '%s' was not found on iNaturalist. Check the spelling and try again.",
-          username
-        )
-        enable("fetch_btn"); enable("username")
-        return()
-      }
-
-      # ── 2. Total count ──────────────────────────────────────────────────────
-      setProgress(0.04, detail = "Counting observations...")
-
-      count_q <- list(user_login = username, per_page = 0)
-      if (qg != "any") count_q$quality_grade <- qg
-
-      total_resp <- safe_get(paste0(BASE_URL, "/observations"), count_q)
-
-      if (is.null(total_resp)) {
-        rv$status    <- "error"
-        rv$error_msg <- "Could not connect to the iNaturalist API. Check your internet connection."
-        enable("fetch_btn"); enable("username")
-        return()
-      }
-
-      total_parsed <- parse_resp(total_resp)
-      total_obs    <- as.integer(total_parsed$total_results %||% 0)
-
-      if (total_obs == 0) {
-        rv$status    <- "error"
-        rv$error_msg <- sprintf(
-          "No %sobservations found for '%s'.",
-          if (qg == "research") "research-grade " else "",
-          username
-        )
-        enable("fetch_btn"); enable("username")
-        return()
-      }
-
-      needs_chunk   <- total_obs > 10000
-      grade_label   <- if (qg == "research") "research-grade " else ""
-
-      rv$status_msg <- sprintf(
-        "Fetching %s %sobservations%s...",
-        format(total_obs, big.mark = ","),
-        grade_label,
-        if (needs_chunk) " (chunking by year — this account is prolific!)" else ""
-      )
-
-      # ── 3. Fetch all observations ───────────────────────────────────────────
-      setProgress(0.07, detail = "Fetching observations...")
-
-      obs_result <- tryCatch(
-        fetch_all_observations(
-          username, total_obs,
-          quality_grade = qg,
-          progress_cb = function(n) {
-            pct <- 0.07 + (n / max(total_obs, 1)) * 0.38
-            setProgress(
-              min(pct, 0.45),
-              detail = sprintf("Fetched %s / %s observations",
-                               format(n, big.mark = ","),
-                               format(total_obs, big.mark = ","))
-            )
-          }
-        ),
-        error = function(e) list(ok = FALSE, err = conditionMessage(e))
-      )
-
-      if (!isTRUE(obs_result$ok) || is.null(obs_result$data)) {
-        rv$status    <- "error"
-        rv$error_msg <- paste0(
-          "Error fetching observations: ",
-          obs_result$err %||% "Unknown error"
-        )
-        enable("fetch_btn"); enable("username")
-        return()
-      }
-
-      if (length(obs_result$data) == 0) {
-        rv$status    <- "error"
-        rv$error_msg <- sprintf(
-          "No research-grade observations found for '%s'.", username
-        )
-        enable("fetch_btn"); enable("username")
-        return()
-      }
-
-      # ── 4. Parse observations ───────────────────────────────────────────────
-      setProgress(0.47, detail = "Parsing observations...")
-
-      obs_df <- obs_list_to_df(obs_result$data)
-
-      if (nrow(obs_df) == 0) {
-        rv$status    <- "error"
-        rv$error_msg <- "Could not parse any observations from the API response."
-        enable("fetch_btn"); enable("username")
-        return()
-      }
-
-      rv$n_total_obs <- nrow(obs_df)
-
-      # ── 5. Summarise unique taxa ────────────────────────────────────────────
-      setProgress(0.50, detail = "Summarising unique taxa...")
-
-      obs_counts <- obs_df %>% count(taxon_id, name = "n_user_obs")
-
-      taxa_df <- obs_df %>%
-        group_by(taxon_id) %>%
-        slice(1) %>%           # keep earliest observation's metadata
-        ungroup() %>%
-        left_join(obs_counts, by = "taxon_id")
-
-      n_taxa    <- nrow(taxa_df)
-      rv$n_taxa <- n_taxa
-
-      n_batches <- ceiling(n_taxa / 30)
-
-      rv$status_msg <- sprintf(
-        "Looking up global counts for %s taxa in %s batched requests (~%s faster)...",
-        format(n_taxa, big.mark = ","),
-        n_batches,
-        paste0(min(n_taxa, 30), "x")
-      )
-
-      # ── 6. Global observation counts (batched /taxa calls) ─────────────────
-      count_vec <- tryCatch(
-        get_global_counts_batch(
-          taxa_df$taxon_id,
-          progress_cb = function(i, total) {
-            pct <- 0.50 + (i / total) * 0.46
-            setProgress(
-              min(pct, 0.97),
-              detail = sprintf("Batch %d / %d  (%d taxa each)",
-                               i, total, 30L)
-            )
-          }
-        ),
-        error = function(e) {
-          warning("Batch count lookup failed: ", conditionMessage(e))
-          setNames(rep(NA_integer_, n_taxa), as.character(taxa_df$taxon_id))
-        }
-      )
-
-      taxa_df$global_count <- count_vec[as.character(taxa_df$taxon_id)]
-
-      # ── 7. Rank and finalise ────────────────────────────────────────────────
-      setProgress(0.99, detail = "Ranking by rarity...")
-
-      rarity_df <- taxa_df %>%
-        filter(!is.na(global_count)) %>%
-        arrange(global_count) %>%
-        mutate(rank = row_number())
-
-      rv$rarity_df  <- rarity_df
-      rv$username   <- username
-      rv$status     <- "done"
-      rv$status_msg <- sprintf(
-        "✅ Done! %s research-grade observations · %s unique taxa ranked · rarest: %s (%s global obs)",
-        format(nrow(obs_df), big.mark = ","),
-        format(nrow(rarity_df), big.mark = ","),
-        coalesce(rarity_df$common_name[1], rarity_df$sci_name[1], "Unknown"),
-        format(rarity_df$global_count[1], big.mark = ",")
-      )
-
-      setProgress(1)
-    })
-
-    enable("fetch_btn")
-    enable("username")
+    schedule(step_verify)
   })
+
 
   # ── Reactive: filtered chart data ──────────────────────────────────────────
   chart_data <- reactive({
@@ -726,7 +784,7 @@ server <- function(input, output, session) {
         taxon_url   = paste0("https://www.inaturalist.org/taxa/", taxon_id),
         your_obs_url = paste0(
           "https://www.inaturalist.org/observations?taxon_id=", taxon_id,
-          "&user_login=", rv$username,
+          "&user_id=", rv$username,
           if (rv$quality_grade != "any") paste0("&quality_grade=", rv$quality_grade) else ""
         ),
         hover_txt = paste0(
@@ -736,16 +794,14 @@ server <- function(input, output, session) {
           "📅 Your date: ", coalesce(obs_date, "unknown"), "<br>",
           "📍 Place: ", coalesce(place, "unknown"), "<br>",
           "🔢 Your obs (this taxon): ", n_user_obs, "<br>",
-          "<a href='", taxon_url, "' target='_blank' style='color:#74ac00;'>",
-          "🔗 Taxon page</a>   ",
-          "<a href='", your_obs_url, "' target='_blank' style='color:#74ac00;'>",
-          "📷 Your observations</a>"
+          "<i style='color:#8fb070;'>Click dot for links →</i>"
         )
       )
 
     use_log <- isTRUE(input$log_scale)
 
-    plot_ly() %>%
+    plot_ly(source = "rarity_plot") %>%
+      event_register("plotly_click") %>%
       # ── Lollipop sticks ──
       add_segments(
         data      = df,
@@ -760,6 +816,9 @@ server <- function(input, output, session) {
         data       = df,
         y          = ~label,
         x          = ~global_count,
+        customdata = ~paste(taxon_id, taxon_url, your_obs_url,
+                            coalesce(common_name, sci_name, "Unknown"),
+                            sep = "|"),
         hoverinfo  = "text",
         text       = ~hover_txt,
         marker     = list(
@@ -815,6 +874,37 @@ server <- function(input, output, session) {
       )
   })
 
+  # ── Click-a-dot: open modal with links (hover tooltips disappear too fast) ─
+  observeEvent(event_data("plotly_click", source = "rarity_plot"), {
+    ev <- event_data("plotly_click", source = "rarity_plot")
+    if (is.null(ev) || is.null(ev$customdata)) return()
+    parts <- strsplit(as.character(ev$customdata), "|", fixed = TRUE)[[1]]
+    if (length(parts) < 4) return()
+
+    showModal(modalDialog(
+      title = tags$span(style = paste0("color:", COL_GREEN, ";"), parts[4]),
+      easyClose = TRUE,
+      footer = modalButton("Close"),
+      tags$p(style = "color:#dde0e4!important; margin-bottom:14px;",
+             "Open on iNaturalist:"),
+      tags$div(
+        style = "display:flex; flex-direction:column; gap:10px;",
+        tags$a(
+          href = parts[2], target = "_blank",
+          style = paste0("background:", COL_GREEN, "; color:#fff!important; padding:10px 14px;",
+                         "border-radius:6px; text-decoration:none; font-weight:600;"),
+          "🔗 Taxon page"
+        ),
+        tags$a(
+          href = parts[3], target = "_blank",
+          style = paste0("background:", COL_GREEN, "; color:#fff!important; padding:10px 14px;",
+                         "border-radius:6px; text-decoration:none; font-weight:600;"),
+          "📷 Your observations of this taxon"
+        )
+      )
+    ))
+  })
+
   # ── DT rarity table ────────────────────────────────────────────────────────
   output$rarity_table <- renderDT({
     req(rv$rarity_df)
@@ -849,7 +939,7 @@ server <- function(input, output, session) {
         Place             = coalesce(place, "—"),
         `Global Obs`      = format(global_count, big.mark = ","),
         `Your Obs`        = sprintf(
-          '<a href="https://www.inaturalist.org/observations?taxon_id=%s&user_login=%s%s" target="_blank" title="View your observations of this taxon" style="color:#74ac00; font-weight:bold;">%s</a>',
+          '<a href="https://www.inaturalist.org/observations?taxon_id=%s&user_id=%s%s" target="_blank" title="View your observations of this taxon" style="color:#74ac00; font-weight:bold;">%s</a>',
           taxon_id, rv$username,
           if (rv$quality_grade != "any") paste0("&quality_grade=", rv$quality_grade) else "",
           n_user_obs
