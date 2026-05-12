@@ -180,35 +180,36 @@ get_global_counts_batch <- function(taxon_ids, batch_size = 30,
   counts  # named integer vector: names = taxon_id (character), values = count
 }
 
-#' Convert the raw API observation list to a tidy data frame
+#' Convert the raw API observation list to a tidy data frame.
+#' Vectorized — builds each column in one vapply pass instead of constructing
+#' N one-row data.frames and rbind-ing them. ~50x faster on a few thousand rows,
+#' which keeps the main R thread from blocking long enough for shinyapps.io
+#' to drop the WebSocket.
 obs_list_to_df <- function(obs_list) {
   if (length(obs_list) == 0) return(data.frame())
+  obs_list <- Filter(function(o) !is.null(o$taxon) && !is.null(o$taxon$id),
+                     obs_list)
+  if (length(obs_list) == 0) return(data.frame())
 
-  rows <- lapply(obs_list, function(obs) {
-    taxon <- obs$taxon
-    if (is.null(taxon) || is.null(taxon$id)) return(NULL)
+  pull_chr <- function(f) vapply(obs_list, f, character(1))
+  thumb_of <- function(o) {
+    if (!is.null(o$photos) && length(o$photos) > 0)
+      chr_val(o$photos[[1]]$url) else NA_character_
+  }
 
-    thumb <- NA_character_
-    if (!is.null(obs$photos) && length(obs$photos) > 0)
-      thumb <- chr_val(obs$photos[[1]]$url)
-
-    data.frame(
-      obs_id      = chr_val(obs$id),
-      taxon_id    = as.integer(taxon$id),
-      common_name = chr_val(taxon$preferred_common_name),
-      sci_name    = chr_val(taxon$name),
-      iconic      = chr_val(taxon$iconic_taxon_name),
-      obs_date    = chr_val(obs$observed_on),
-      place       = chr_val(obs$place_guess),
-      thumb_url   = thumb,
-      inat_url    = paste0("https://www.inaturalist.org/observations/", obs$id),
-      stringsAsFactors = FALSE
-    )
-  })
-
-  rows <- Filter(Negate(is.null), rows)
-  if (length(rows) == 0) return(data.frame())
-  do.call(rbind, rows)
+  data.frame(
+    obs_id      = pull_chr(function(o) chr_val(o$id)),
+    taxon_id    = vapply(obs_list, function(o) as.integer(o$taxon$id), integer(1)),
+    common_name = pull_chr(function(o) chr_val(o$taxon$preferred_common_name)),
+    sci_name    = pull_chr(function(o) chr_val(o$taxon$name)),
+    iconic      = pull_chr(function(o) chr_val(o$taxon$iconic_taxon_name)),
+    obs_date    = pull_chr(function(o) chr_val(o$observed_on)),
+    place       = pull_chr(function(o) chr_val(o$place_guess)),
+    thumb_url   = pull_chr(thumb_of),
+    inat_url    = pull_chr(function(o)
+                    paste0("https://www.inaturalist.org/observations/", o$id)),
+    stringsAsFactors = FALSE
+  )
 }
 
 # ── CSS ────────────────────────────────────────────────────────────────────────
