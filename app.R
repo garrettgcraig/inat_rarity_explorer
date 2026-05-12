@@ -592,7 +592,8 @@ server <- function(input, output, session) {
       finish_error("Could not parse any observations from the API response.")
       return()
     }
-    rv$n_total_obs <- nrow(fs$obs_df)
+    fs$n_total_obs <- nrow(fs$obs_df)
+    rv$n_total_obs <- fs$n_total_obs
     schedule(step_summarise)
   }
 
@@ -603,7 +604,8 @@ server <- function(input, output, session) {
       group_by(taxon_id) %>% slice(1) %>% ungroup() %>%
       left_join(oc, by = "taxon_id")
     fs$obs_df <- NULL  # free memory
-    rv$n_taxa <- nrow(fs$taxa_df)
+    fs$n_taxa <- nrow(fs$taxa_df)
+    rv$n_taxa <- fs$n_taxa
     ids <- as.character(unique(fs$taxa_df$taxon_id))
     fs$batches   <- split(ids, ceiling(seq_along(ids) / 30))
     fs$n_batches <- length(fs$batches)
@@ -611,7 +613,7 @@ server <- function(input, output, session) {
     fs$counts    <- setNames(rep(NA_integer_, length(ids)), ids)
     rv$status_msg <- sprintf(
       "Looking up global counts for %s taxa in %d batches...",
-      format(rv$n_taxa, big.mark = ","), fs$n_batches)
+      format(fs$n_taxa, big.mark = ","), fs$n_batches)
     schedule(step_lookup)
   }
 
@@ -651,7 +653,7 @@ server <- function(input, output, session) {
     r1 <- rarity_df
     rv$status_msg <- sprintf(
       "✅ Done! %s observations · %s unique taxa ranked · rarest: %s (%s global obs)",
-      format(rv$n_total_obs, big.mark = ","),
+      format(fs$n_total_obs, big.mark = ","),
       format(nrow(r1), big.mark = ","),
       coalesce(r1$common_name[1], r1$sci_name[1], "Unknown"),
       format(r1$global_count[1], big.mark = ","))
