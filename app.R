@@ -180,6 +180,27 @@ get_global_counts_batch <- function(taxon_ids, batch_size = 30,
   counts  # named integer vector: names = taxon_id (character), values = count
 }
 
+#' Slim a raw observation object down to only the fields we use. Called as
+#' each page lands so we never hold the fat JSON blobs (comments, IDs, sounds,
+#' geojson, faves, etc.) — keeps peak memory under shinyapps.io's 1 GB cap.
+slim_obs <- function(o) {
+  taxon <- o$taxon
+  if (is.null(taxon) || is.null(taxon$id)) return(NULL)
+  list(
+    id          = o$id,
+    observed_on = o$observed_on,
+    place_guess = o$place_guess,
+    photo_url   = if (!is.null(o$photos) && length(o$photos) > 0)
+                    o$photos[[1]]$url else NULL,
+    taxon = list(
+      id                    = taxon$id,
+      name                  = taxon$name,
+      preferred_common_name = taxon$preferred_common_name,
+      iconic_taxon_name     = taxon$iconic_taxon_name
+    )
+  )
+}
+
 #' Convert the raw API observation list to a tidy data frame.
 #' Vectorized — builds each column in one vapply pass instead of constructing
 #' N one-row data.frames and rbind-ing them. ~50x faster on a few thousand rows,
@@ -187,15 +208,10 @@ get_global_counts_batch <- function(taxon_ids, batch_size = 30,
 #' to drop the WebSocket.
 obs_list_to_df <- function(obs_list) {
   if (length(obs_list) == 0) return(data.frame())
-  obs_list <- Filter(function(o) !is.null(o$taxon) && !is.null(o$taxon$id),
-                     obs_list)
+  obs_list <- Filter(Negate(is.null), obs_list)
   if (length(obs_list) == 0) return(data.frame())
 
   pull_chr <- function(f) vapply(obs_list, f, character(1))
-  thumb_of <- function(o) {
-    if (!is.null(o$photos) && length(o$photos) > 0)
-      chr_val(o$photos[[1]]$url) else NA_character_
-  }
 
   data.frame(
     obs_id      = pull_chr(function(o) chr_val(o$id)),
@@ -205,7 +221,7 @@ obs_list_to_df <- function(obs_list) {
     iconic      = pull_chr(function(o) chr_val(o$taxon$iconic_taxon_name)),
     obs_date    = pull_chr(function(o) chr_val(o$observed_on)),
     place       = pull_chr(function(o) chr_val(o$place_guess)),
-    thumb_url   = pull_chr(thumb_of),
+    thumb_url   = pull_chr(function(o) chr_val(o$photo_url)),
     inat_url    = pull_chr(function(o)
                     paste0("https://www.inaturalist.org/observations/", o$id)),
     stringsAsFactors = FALSE
@@ -476,7 +492,7 @@ server <- function(input, output, session) {
   finish_error <- function(msg) {
     rv$status    <- "error"
     rv$error_msg <- msg
-    fs$obs_list  <- NULL
+    fs$pages     <- NULL
     fs$obs_df    <- NULL
     fs$taxa_df   <- NULL
     fs$counts    <- NULL
@@ -515,7 +531,8 @@ server <- function(input, output, session) {
     fs$total_obs   <- total
     fs$needs_chunk <- total > 10000
     fs$per_page    <- 200
-    fs$obs_list    <- list()
+    fs$pages       <- list()
+    fs$n_so_far    <- 0L
 
     if (fs$needs_chunk) {
       fs$cur_year <- 2007L
@@ -562,11 +579,17 @@ server <- function(input, output, session) {
                            per_page = fs$per_page,
                            d1 = fs$d1, d2 = fs$d2,
                            quality_grade = fs$qg)
-    if (!is.null(page) && length(page$results) > 0)
-      fs$obs_list <- c(fs$obs_list, page$results)
+    if (!is.null(page) && length(page$results) > 0) {
+      # Slim each observation immediately so the fat JSON blob from httr
+      # becomes GC-eligible before the next page lands. Store as a list of
+      # pages (not flat list) to avoid O(n²) memory churn from repeated c().
+      slimmed <- Filter(Negate(is.null), lapply(page$results, slim_obs))
+      fs$pages[[length(fs$pages) + 1L]] <- slimmed
+      fs$n_so_far <- (fs$n_so_far %||% 0L) + length(slimmed)
+    }
 
     rv$status_msg <- sprintf("Fetched %s / %s observations...",
-                             format(length(fs$obs_list), big.mark = ","),
+                             format(fs$n_so_far %||% 0L, big.mark = ","),
                              format(fs$total_obs, big.mark = ","))
 
     if (fs$cur_page < fs$n_pages) {
@@ -582,12 +605,14 @@ server <- function(input, output, session) {
 
   step_parse <- function() {
     rv$status_msg <- "Parsing observations..."
-    if (length(fs$obs_list) == 0) {
+    obs_list <- if (length(fs$pages) > 0) do.call(c, fs$pages) else list()
+    fs$pages <- NULL  # free memory
+    if (length(obs_list) == 0) {
       finish_error(sprintf("No observations found for '%s'.", fs$username))
       return()
     }
-    fs$obs_df   <- obs_list_to_df(fs$obs_list)
-    fs$obs_list <- NULL  # free memory
+    fs$obs_df <- obs_list_to_df(obs_list)
+    rm(obs_list)
     if (nrow(fs$obs_df) == 0) {
       finish_error("Could not parse any observations from the API response.")
       return()
@@ -682,7 +707,7 @@ server <- function(input, output, session) {
     fs$generation <- fs$generation + 1L
     fs$username   <- username
     fs$qg         <- qg
-    fs$obs_list   <- NULL
+    fs$pages      <- NULL
     fs$obs_df     <- NULL
     fs$taxa_df    <- NULL
     fs$counts     <- NULL
