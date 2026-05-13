@@ -953,11 +953,13 @@ server <- function(input, output, session) {
           ifelse(
             !is.na(thumb_url) & nzchar(coalesce(thumb_url, "")),
             sprintf(
-              '<img src="%s" height="55" style="border-radius:5px;',
-              ' border:1.5px solid #74ac00;"',
-              ' onerror="this.outerHTML=\'<span style=font-size:22px>📷</span>\'">',
+              paste0(
+                '<img src="%s" height="55" style="border-radius:5px;',
+                ' border:1.5px solid #74ac00;"',
+                ' onerror="this.outerHTML=\'<span style=font-size:22px>📷</span>\'">'
+              ),
               thumb_url
-            ) |> paste(collapse = ""),
+            ),
             "<span style='font-size:22px;'>🔗</span>"
           )
         ),
