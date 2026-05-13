@@ -346,10 +346,7 @@ ui <- dashboardPage(
   skin = "black",
 
   dashboardHeader(
-    title     = tags$div(
-      style = "display:flex; align-items:center; gap:8px; font-weight:700; font-size:17px;",
-      "🌿 iNat Rarity Explorer"
-    ),
+    title     = "🌿 iNat Rarity Explorer",
     titleWidth = 275
   ),
 
