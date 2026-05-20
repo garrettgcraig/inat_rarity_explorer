@@ -19,6 +19,21 @@ library(later)
 BASE_URL      <- "https://api.inaturalist.org/v1"
 COL_GREEN     <- "#74ac00"
 REQUEST_DELAY <- 0.08   # seconds between observation page fetches — be polite
+INAT_UA       <- "iNat Rarity Explorer (https://garrettgcraig.com)"
+
+# Concurrency knobs. iNat allows up to 60 req/min — stay well below.
+CONCURRENCY_PAGES   <- 4L    # pages of /observations fired in parallel
+CONCURRENCY_TAXA    <- 3L    # /taxa batches fired in parallel
+TAXA_BATCH_SIZE     <- 200L  # taxon IDs per /taxa call (was 30)
+
+# Fields filter: ask iNat to send only what we use. Smaller responses → faster
+# transfer AND less JSON to parse on the (single) R thread.
+OBS_FIELDS  <- "id,observed_on,place_guess,photos,taxon"
+TAXA_FIELDS <- "id,observations_count"
+
+# Process-wide cache of global taxon observation counts. Survives across
+# sessions in the same R worker — repeat lookups for popular taxa are free.
+.global_count_cache <- new.env(parent = emptyenv())
 
 # ── NULL-coalescing helper ─────────────────────────────────────────────────────
 `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !is.na(a[1])) a else b
@@ -41,6 +56,79 @@ safe_get <- function(url, query = list(), retries = 3, timeout_secs = 30) {
     if (i < retries) Sys.sleep(min(i * 0.5, 2))
   }
   NULL
+}
+
+#' Fire N HTTP GETs in parallel using libcurl's multi interface and return a
+#' list of parsed JSON bodies (NULL on error). Blocks until all complete or
+#' timeout. Connections are pooled, so TLS handshake is amortized across the
+#' batch. This is what makes the fetch and lookup phases fast.
+inat_multi_get_json <- function(urls, max_concurrent = 4L, timeout = 60L) {
+  if (length(urls) == 0L) return(list())
+  results <- vector("list", length(urls))
+  pool <- curl::new_pool(total_con = max_concurrent,
+                         host_con  = max_concurrent)
+  for (i in seq_along(urls)) {
+    local({
+      idx <- i
+      h   <- curl::new_handle()
+      curl::handle_setheaders(h,
+        "User-Agent" = INAT_UA,
+        "Accept"     = "application/json"
+      )
+      curl::handle_setopt(h,
+        connecttimeout = 10L,
+        timeout        = as.integer(timeout),
+        accept_encoding = "gzip"
+      )
+      curl::curl_fetch_multi(
+        urls[[idx]], handle = h, pool = pool,
+        done = function(res) {
+          if (res$status_code >= 200 && res$status_code < 300) {
+            results[[idx]] <<- tryCatch(
+              jsonlite::fromJSON(rawToChar(res$content),
+                                 simplifyVector = FALSE),
+              error = function(e) NULL
+            )
+          }
+        },
+        fail = function(err) NULL
+      )
+    })
+  }
+  curl::multi_run(pool = pool, timeout = timeout)
+  results
+}
+
+#' Build an /observations URL with the fields filter and optional date window.
+build_obs_url <- function(username, page, per_page = 200L,
+                          d1 = NULL, d2 = NULL,
+                          quality_grade = "research",
+                          id_above = NULL) {
+  qs <- list(
+    user_login = username,
+    per_page   = per_page,
+    order      = "asc",
+    order_by   = "id",
+    fields     = OBS_FIELDS
+  )
+  # Prefer id_above cursor when supplied (works past the page=1..50 cap);
+  # otherwise fall back to page-based pagination.
+  if (!is.null(id_above)) qs$id_above <- id_above
+  else                    qs$page     <- page
+  if (!is.null(quality_grade) && quality_grade != "any")
+    qs$quality_grade <- quality_grade
+  if (!is.null(d1)) qs$d1 <- d1
+  if (!is.null(d2)) qs$d2 <- d2
+  modify_url(paste0(BASE_URL, "/observations"), query = qs)
+}
+
+#' Build a /taxa URL for a batch of taxon IDs.
+build_taxa_url <- function(ids, per_page = TAXA_BATCH_SIZE) {
+  modify_url(paste0(BASE_URL, "/taxa"), query = list(
+    id       = paste(ids, collapse = ","),
+    per_page = per_page,
+    fields   = TAXA_FIELDS
+  ))
 }
 
 #' Parse JSON response body
@@ -66,119 +154,8 @@ check_user_exists <- function(username) {
   }))
 }
 
-#' Fetch a single page of observations.
-#' quality_grade: "research", "needs_id", "casual", or NULL for all grades.
-fetch_obs_page <- function(username, page = 1, per_page = 200,
-                           d1 = NULL, d2 = NULL, quality_grade = "research") {
-  q <- list(
-    user_login = username,
-    per_page   = per_page,
-    page       = page,
-    order      = "asc",
-    order_by   = "observed_on"
-  )
-  if (!is.null(quality_grade) && quality_grade != "any") q$quality_grade <- quality_grade
-  if (!is.null(d1)) q$d1 <- d1
-  if (!is.null(d2)) q$d2 <- d2
-  parse_resp(safe_get(paste0(BASE_URL, "/observations"), q))
-}
-
-#' Fetch all observations within a date range (handles the 10 k API cap)
-fetch_range <- function(username, d1 = NULL, d2 = NULL,
-                        quality_grade = "research", progress_cb = NULL) {
-  first <- fetch_obs_page(username, page = 1, d1 = d1, d2 = d2,
-                          quality_grade = quality_grade)
-  if (is.null(first)) return(list(ok = FALSE, data = NULL,
-                                  err = "API request failed"))
-
-  total   <- as.integer(first$total_results %||% 0)
-  if (total == 0) return(list(ok = TRUE, data = list(), actual_total = 0))
-
-  n_fetch  <- min(total, 10000)
-  per_page <- 200
-  n_pages  <- ceiling(n_fetch / per_page)
-  all_obs  <- first$results
-
-  if (n_pages >= 2) {
-    for (pg in 2:n_pages) {
-      pg_data <- fetch_obs_page(username, page = pg, d1 = d1, d2 = d2,
-                                quality_grade = quality_grade)
-      if (!is.null(pg_data) && length(pg_data$results) > 0)
-        all_obs <- c(all_obs, pg_data$results)
-      if (!is.null(progress_cb)) progress_cb(length(all_obs))
-      Sys.sleep(REQUEST_DELAY)
-    }
-  }
-
-  list(ok = TRUE, data = all_obs, actual_total = total)
-}
-
-#' Fetch ALL observations, using year-by-year chunking when total > 10 k
-fetch_all_observations <- function(username, total_obs,
-                                   quality_grade = "research",
-                                   progress_cb = NULL) {
-  if (total_obs <= 10000) {
-    return(fetch_range(username, quality_grade = quality_grade,
-                       progress_cb = progress_cb))
-  }
-
-  all_obs    <- list()
-  start_year <- 2007
-  end_year   <- as.integer(format(Sys.Date(), "%Y"))
-
-  for (yr in start_year:end_year) {
-    d1 <- sprintf("%d-01-01", yr)
-    d2 <- sprintf("%d-12-31", yr)
-
-    chunk <- fetch_range(username, d1 = d1, d2 = d2,
-                         quality_grade = quality_grade,
-                         progress_cb = function(n) {
-      if (!is.null(progress_cb)) progress_cb(length(all_obs) + n)
-    })
-
-    if (isTRUE(chunk$ok) && length(chunk$data) > 0)
-      all_obs <- c(all_obs, chunk$data)
-
-    if (!is.null(progress_cb)) progress_cb(length(all_obs))
-    Sys.sleep(0.25)
-  }
-
-  list(ok = TRUE, data = all_obs)
-}
-
-#' Fetch global observation counts for many taxa in batched /taxa calls.
-#' The /taxa endpoint returns observations_count on each taxon object,
-#' letting us resolve ~30 taxa per request instead of 1 — a ~30x speedup.
-get_global_counts_batch <- function(taxon_ids, batch_size = 30,
-                                    progress_cb = NULL) {
-  ids       <- as.character(unique(taxon_ids))
-  counts    <- setNames(rep(NA_integer_, length(ids)), ids)
-  batches   <- split(ids, ceiling(seq_along(ids) / batch_size))
-  n_batches <- length(batches)
-
-  for (i in seq_along(batches)) {
-    ids_str <- paste(batches[[i]], collapse = ",")
-    resp    <- safe_get(
-      paste0(BASE_URL, "/taxa"),
-      list(id = ids_str, per_page = batch_size)
-    )
-    parsed <- parse_resp(resp)
-
-    if (!is.null(parsed) && length(parsed$results) > 0) {
-      for (taxon in parsed$results) {
-        tid <- as.character(taxon$id)
-        if (tid %in% names(counts)) {
-          counts[tid] <- as.integer(taxon$observations_count %||% NA_integer_)
-        }
-      }
-    }
-
-    if (!is.null(progress_cb)) progress_cb(i, n_batches)
-    Sys.sleep(0.1)
-  }
-
-  counts  # named integer vector: names = taxon_id (character), values = count
-}
+# (Legacy synchronous fetchers removed — the state machine in server() now
+# uses inat_multi_get_json + build_obs_url / build_taxa_url directly.)
 
 #' Slim a raw observation object down to only the fields we use. Called as
 #' each page lands so we never hold the fat JSON blobs (comments, IDs, sounds,
@@ -526,78 +503,99 @@ server <- function(input, output, session) {
       return()
     }
     fs$total_obs   <- total
-    fs$needs_chunk <- total > 10000
-    fs$per_page    <- 200
+    fs$per_page    <- 200L
     fs$pages       <- list()
     fs$n_so_far    <- 0L
+    fs$d1          <- NULL
+    fs$d2          <- NULL
 
-    if (fs$needs_chunk) {
-      fs$cur_year <- 2007L
-      fs$end_year <- as.integer(format(Sys.Date(), "%Y"))
-      rv$status_msg <- sprintf(
-        "Fetching %s observations year by year (account is prolific)...",
-        format(total, big.mark = ","))
-      schedule(step_fetch_year_start)
-    } else {
-      fs$d1 <- NULL; fs$d2 <- NULL
-      fs$cur_page <- 1L
-      fs$n_pages  <- ceiling(min(total, 10000) / fs$per_page)
+    # iNat caps page-based pagination at page*per_page <= 10 000. For ≤10k
+    # accounts we use page-based pagination AND fire pages in parallel — fast.
+    # For >10k accounts we cursor with id_above (sequential, but unbounded).
+    if (total <= 10000) {
+      fs$cur_page  <- 1L
+      fs$n_pages   <- ceiling(total / fs$per_page)
+      fs$use_cursor <- FALSE
       rv$status_msg <- sprintf("Fetching %s observations...",
                                format(total, big.mark = ","))
-      schedule(step_fetch_page)
+    } else {
+      fs$id_above   <- 0L
+      fs$use_cursor <- TRUE
+      rv$status_msg <- sprintf(
+        "Fetching %s observations (cursor mode for large account)...",
+        format(total, big.mark = ","))
     }
-  }
-
-  step_fetch_year_start <- function() {
-    if (fs$cur_year > fs$end_year) {
-      schedule(step_parse)
-      return()
-    }
-    fs$d1 <- sprintf("%d-01-01", fs$cur_year)
-    fs$d2 <- sprintf("%d-12-31", fs$cur_year)
-    q <- list(user_login = fs$username, per_page = 0,
-              d1 = fs$d1, d2 = fs$d2)
-    if (fs$qg != "any") q$quality_grade <- fs$qg
-    resp <- safe_get(paste0(BASE_URL, "/observations"), q)
-    yr_total <- if (!is.null(resp))
-      as.integer(parse_resp(resp)$total_results %||% 0) else 0L
-    if (yr_total == 0) {
-      fs$cur_year <- fs$cur_year + 1L
-      schedule(step_fetch_year_start)
-      return()
-    }
-    fs$cur_page <- 1L
-    fs$n_pages  <- ceiling(min(yr_total, 10000) / fs$per_page)
     schedule(step_fetch_page)
   }
 
+  # Handle a parallel batch of observation pages (cursor or page-based).
+  # For page-based: fires CONCURRENCY_PAGES requests at once.
+  # For cursor: must run sequentially since each id_above depends on the prior
+  # response's max id.
   step_fetch_page <- function() {
-    page <- fetch_obs_page(fs$username, page = fs$cur_page,
-                           per_page = fs$per_page,
-                           d1 = fs$d1, d2 = fs$d2,
-                           quality_grade = fs$qg)
-    if (!is.null(page) && length(page$results) > 0) {
-      # Slim each observation immediately so the fat JSON blob from httr
-      # becomes GC-eligible before the next page lands. Store as a list of
-      # pages (not flat list) to avoid O(n²) memory churn from repeated c().
-      slimmed <- Filter(Negate(is.null), lapply(page$results, slim_obs))
-      fs$pages[[length(fs$pages) + 1L]] <- slimmed
-      fs$n_so_far <- (fs$n_so_far %||% 0L) + length(slimmed)
+    if (fs$use_cursor) {
+      # Sequential id_above cursor: one page per tick. Still benefits from
+      # `fields=` and keep-alive within inat_multi_get_json's pool.
+      url <- build_obs_url(fs$username, page = NULL, per_page = fs$per_page,
+                           quality_grade = fs$qg,
+                           id_above = fs$id_above)
+      resp <- inat_multi_get_json(url, max_concurrent = 1L)[[1]]
+      results <- if (!is.null(resp)) resp$results else list()
+      if (length(results) == 0L) {
+        schedule(step_parse)
+        return()
+      }
+      slimmed <- Filter(Negate(is.null), lapply(results, slim_obs))
+      if (length(slimmed) > 0L) {
+        fs$pages[[length(fs$pages) + 1L]] <- slimmed
+        fs$n_so_far <- fs$n_so_far + length(slimmed)
+      }
+      # Next cursor = highest id seen this page (iNat returns ascending).
+      ids_this <- vapply(results, function(o) as.integer(o$id %||% 0L),
+                         integer(1))
+      fs$id_above <- max(ids_this, na.rm = TRUE)
+
+      rv$status_msg <- sprintf("Fetched %s / %s observations...",
+                               format(fs$n_so_far, big.mark = ","),
+                               format(fs$total_obs, big.mark = ","))
+
+      # Done when iNat returns fewer than per_page (last page).
+      if (length(results) < fs$per_page) schedule(step_parse)
+      else                                schedule(step_fetch_page, delay = 0.05)
+      return()
+    }
+
+    # Page-based parallel branch: fire CONCURRENCY_PAGES pages at once.
+    if (fs$cur_page > fs$n_pages) {
+      schedule(step_parse)
+      return()
+    }
+    this_batch <- seq.int(
+      fs$cur_page,
+      min(fs$cur_page + CONCURRENCY_PAGES - 1L, fs$n_pages)
+    )
+    urls <- vapply(this_batch, function(p) {
+      build_obs_url(fs$username, page = p, per_page = fs$per_page,
+                    d1 = fs$d1, d2 = fs$d2, quality_grade = fs$qg)
+    }, character(1))
+
+    responses <- inat_multi_get_json(urls, max_concurrent = CONCURRENCY_PAGES)
+    for (resp in responses) {
+      if (is.null(resp) || length(resp$results) == 0L) next
+      slimmed <- Filter(Negate(is.null), lapply(resp$results, slim_obs))
+      if (length(slimmed) > 0L) {
+        fs$pages[[length(fs$pages) + 1L]] <- slimmed
+        fs$n_so_far <- fs$n_so_far + length(slimmed)
+      }
     }
 
     rv$status_msg <- sprintf("Fetched %s / %s observations...",
-                             format(fs$n_so_far %||% 0L, big.mark = ","),
+                             format(fs$n_so_far, big.mark = ","),
                              format(fs$total_obs, big.mark = ","))
 
-    if (fs$cur_page < fs$n_pages) {
-      fs$cur_page <- fs$cur_page + 1L
-      schedule(step_fetch_page, delay = 0.08)
-    } else if (fs$needs_chunk) {
-      fs$cur_year <- fs$cur_year + 1L
-      schedule(step_fetch_year_start, delay = 0.2)
-    } else {
-      schedule(step_parse)
-    }
+    fs$cur_page <- fs$cur_page + length(this_batch)
+    if (fs$cur_page > fs$n_pages) schedule(step_parse)
+    else                          schedule(step_fetch_page, delay = 0.05)
   }
 
   step_parse <- function() {
@@ -629,36 +627,59 @@ server <- function(input, output, session) {
     fs$n_taxa <- nrow(fs$taxa_df)
     rv$n_taxa <- fs$n_taxa
     ids <- as.character(unique(fs$taxa_df$taxon_id))
-    fs$batches   <- split(ids, ceiling(seq_along(ids) / 30))
+    fs$counts <- setNames(rep(NA_integer_, length(ids)), ids)
+
+    # Fill from the process-wide cache; only the unseen IDs need an API call.
+    cached_ids <- intersect(ids, ls(.global_count_cache))
+    for (id in cached_ids) {
+      fs$counts[id] <- get(id, envir = .global_count_cache)
+    }
+    uncached <- setdiff(ids, cached_ids)
+
+    if (length(uncached) == 0L) {
+      schedule(step_rank)
+      return()
+    }
+    fs$batches   <- split(uncached,
+                          ceiling(seq_along(uncached) / TAXA_BATCH_SIZE))
     fs$n_batches <- length(fs$batches)
     fs$cur_batch <- 1L
-    fs$counts    <- setNames(rep(NA_integer_, length(ids)), ids)
     rv$status_msg <- sprintf(
-      "Looking up global counts for %s taxa in %d batches...",
-      format(fs$n_taxa, big.mark = ","), fs$n_batches)
+      "Looking up global counts for %s taxa (%d cached, %d to fetch in %d batches)...",
+      format(fs$n_taxa, big.mark = ","),
+      length(cached_ids), length(uncached), fs$n_batches)
     schedule(step_lookup)
   }
 
+  # Fire CONCURRENCY_TAXA /taxa batches in parallel each tick. Each batch
+  # carries up to TAXA_BATCH_SIZE (200) IDs — vs. the old 30 per call.
+  # Combined: ~6× fewer requests AND each round serves ~3 in parallel.
   step_lookup <- function() {
     if (fs$cur_batch > fs$n_batches) {
       schedule(step_rank)
       return()
     }
-    batch <- fs$batches[[fs$cur_batch]]
-    resp <- safe_get(paste0(BASE_URL, "/taxa"),
-                     list(id = paste(batch, collapse = ","), per_page = 30))
-    parsed <- parse_resp(resp)
-    if (!is.null(parsed) && length(parsed$results) > 0) {
-      for (taxon in parsed$results) {
-        tid <- as.character(taxon$id)
-        if (tid %in% names(fs$counts))
-          fs$counts[tid] <- as.integer(taxon$observations_count %||% NA_integer_)
+    end_batch <- min(fs$cur_batch + CONCURRENCY_TAXA - 1L, fs$n_batches)
+    these     <- seq.int(fs$cur_batch, end_batch)
+    urls      <- vapply(these, function(i) build_taxa_url(fs$batches[[i]]),
+                        character(1))
+
+    responses <- inat_multi_get_json(urls, max_concurrent = CONCURRENCY_TAXA)
+    for (resp in responses) {
+      if (is.null(resp) || length(resp$results) == 0L) next
+      for (taxon in resp$results) {
+        tid <- as.character(taxon$id %||% NA)
+        if (is.na(tid) || !nzchar(tid)) next
+        cnt <- as.integer(taxon$observations_count %||% NA_integer_)
+        if (tid %in% names(fs$counts)) fs$counts[tid] <- cnt
+        if (!is.na(cnt)) assign(tid, cnt, envir = .global_count_cache)
       }
     }
+
     rv$status_msg <- sprintf("Looking up global counts — batch %d / %d",
-                             fs$cur_batch, fs$n_batches)
-    fs$cur_batch <- fs$cur_batch + 1L
-    schedule(step_lookup, delay = 0.1)
+                             end_batch, fs$n_batches)
+    fs$cur_batch <- end_batch + 1L
+    schedule(step_lookup, delay = 0.05)
   }
 
   step_rank <- function() {
