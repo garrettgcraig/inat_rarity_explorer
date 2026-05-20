@@ -21,6 +21,26 @@ COL_GREEN     <- "#74ac00"
 REQUEST_DELAY <- 0.08   # seconds between observation page fetches — be polite
 INAT_UA       <- "iNat Rarity Explorer (https://garrettgcraig.com)"
 
+# Color palette for iconic taxa in the scatter plot. iNat uses these
+# kingdoms/classes as top-level groupings; keeping consistent colors makes
+# it easy to scan the scatter for patterns.
+ICONIC_COLORS <- c(
+  Aves         = "#3a8fd6",  # birds      — blue
+  Mammalia     = "#a06a3a",  # mammals    — brown
+  Reptilia     = "#7d5fa0",  # reptiles   — purple
+  Amphibia     = "#3aaa7c",  # amphibians — teal
+  Actinopterygii = "#4cc6c0",# fish       — cyan
+  Mollusca     = "#c06090",  # mollusks   — magenta
+  Arachnida    = "#a04040",  # arachnids  — dark red
+  Insecta      = "#d6a040",  # insects    — gold
+  Plantae      = "#74ac00",  # plants     — green
+  Fungi        = "#d06c30",  # fungi      — orange
+  Chromista    = "#7090a0",  # algae etc. — slate
+  Protozoa     = "#506070",  # protozoa   — grey
+  Animalia     = "#90659a",  # other animals
+  Unknown      = "#6080a0"
+)
+
 # Concurrency knobs. iNat allows up to 60 req/min — stay well below.
 CONCURRENCY_PAGES   <- 4L    # pages of /observations fired in parallel
 CONCURRENCY_TAXA    <- 3L    # /taxa batches fired in parallel
@@ -234,6 +254,66 @@ dark_css <- sprintf('
   }
   .skin-black .sidebar a { color: #b0c8a0 !important; }
 
+  /* Trophy case cards (top-5 rarest) */
+  .trophy-card {
+    background: linear-gradient(160deg, #1c2838 0%%, #131c28 100%%);
+    border: 1px solid #2c4030;
+    border-radius: 10px;
+    padding: 12px 12px 14px 12px;
+    text-align: center;
+    transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
+    height: 100%%;
+    box-shadow: 0 2px 10px rgba(0,0,0,.35);
+    position: relative;
+  }
+  .trophy-card:hover {
+    transform: translateY(-2px);
+    border-color: %1$s;
+    box-shadow: 0 6px 18px rgba(116,172,0,.18);
+  }
+  .trophy-rank {
+    position: absolute; top: 8px; left: 10px;
+    background: %1$s; color: #0b1017;
+    font-weight: 800; font-size: 12px;
+    padding: 2px 8px; border-radius: 10px;
+    letter-spacing: .5px;
+  }
+  .trophy-photo {
+    width: 100%%; aspect-ratio: 1 / 1;
+    object-fit: cover; border-radius: 8px;
+    border: 2px solid #2c4030; margin-bottom: 10px;
+  }
+  .trophy-photo-fallback {
+    width: 100%%; aspect-ratio: 1 / 1; border-radius: 8px;
+    background: #0b1017; border: 2px solid #2c4030;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 36px; margin-bottom: 10px;
+  }
+  .trophy-name {
+    color: #e0e8d8; font-weight: 700; font-size: 14px;
+    line-height: 1.2; margin: 2px 0 2px 0;
+    overflow: hidden; text-overflow: ellipsis;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    min-height: 34px;
+  }
+  .trophy-sci {
+    color: #8fb070; font-style: italic; font-size: 11.5px;
+    margin-bottom: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .trophy-stats {
+    display: flex; justify-content: space-around; margin-top: 6px;
+    border-top: 1px solid #233040; padding-top: 7px;
+  }
+  .trophy-stat-num {
+    color: %1$s; font-weight: 700; font-size: 14px; display: block;
+  }
+  .trophy-stat-lbl {
+    color: #6a8090; font-size: 10px; text-transform: uppercase;
+    letter-spacing: .4px;
+  }
+  .trophy-card a { text-decoration: none !important; color: inherit !important; }
+  .trophy-card a:hover { color: inherit !important; }
+
   /* Boxes */
   .box {
     background-color: #172030 !important;
@@ -414,11 +494,35 @@ ui <- dashboardPage(
 
       fluidRow(
         box(
-          title  = tags$span(icon("chart-bar"), "  Rarity Chart — Top N Rarest of Your Taxa"),
-          width  = 12,
-          withSpinner(
-            plotlyOutput("rarity_plot", height = "530px"),
-            color = COL_GREEN, type = 6
+          title = tags$span(icon("trophy"), "  Trophy Case — Your 5 Rarest Finds"),
+          width = 12,
+          uiOutput("trophy_case")
+        )
+      ),
+
+      fluidRow(
+        tabBox(
+          title = tags$span(icon("chart-bar"), "  Rarity Views"),
+          width = 12,
+          id    = "rarity_tabs",
+          tabPanel(
+            tags$span(icon("chart-bar"), "  Top N Lollipop"),
+            withSpinner(
+              plotlyOutput("rarity_plot", height = "530px"),
+              color = COL_GREEN, type = 6
+            )
+          ),
+          tabPanel(
+            tags$span(icon("braille"), "  Rarity vs. Effort Scatter"),
+            div(style = "margin: 4px 0 8px 0; font-size: 12.5px; color:#7a8ea0;",
+                "Every taxon you have observed. ",
+                tags$b("Bottom-left = rare globally AND seen only once by you"),
+                " — the most interesting quadrant. Hover for details, ",
+                "color = iconic taxon group."),
+            withSpinner(
+              plotlyOutput("rarity_scatter", height = "560px"),
+              color = COL_GREEN, type = 6
+            )
           )
         )
       ),
@@ -836,6 +940,152 @@ server <- function(input, output, session) {
     )
   })
 
+  # ── Trophy case (top 5 rarest as photo cards) ──────────────────────────────
+  output$trophy_case <- renderUI({
+    df <- rv$rarity_df
+    req(df, nrow(df) > 0)
+    top <- head(df, 5)
+
+    build_url <- function(r) {
+      paste0("https://www.inaturalist.org/observations?taxon_id=", r$taxon_id,
+             "&user_id=", rv$username,
+             if (rv$quality_grade != "any")
+               paste0("&quality_grade=", rv$quality_grade) else "")
+    }
+
+    cards <- lapply(seq_len(nrow(top)), function(i) {
+      r        <- top[i, ]
+      photo    <- if (!is.na(r$thumb_url) && nzchar(r$thumb_url)) {
+        tags$img(src = r$thumb_url, class = "trophy-photo",
+                 onerror = "this.outerHTML='<div class=\"trophy-photo-fallback\">📷</div>'")
+      } else {
+        tags$div(class = "trophy-photo-fallback", "📷")
+      }
+      common   <- coalesce(r$common_name, r$sci_name, "Unknown")
+      sci      <- coalesce(r$sci_name, "")
+      column(
+        width = 12 / 5,   # 5 cards across on desktop
+        tags$a(
+          href = build_url(r), target = "_blank",
+          tags$div(
+            class = "trophy-card",
+            tags$div(class = "trophy-rank", paste0("#", r$rank)),
+            photo,
+            tags$div(class = "trophy-name",
+                     tools::toTitleCase(tolower(common))),
+            tags$div(class = "trophy-sci", tags$em(sci)),
+            tags$div(
+              class = "trophy-stats",
+              tags$div(
+                tags$span(class = "trophy-stat-num",
+                          format(r$global_count, big.mark = ",")),
+                tags$span(class = "trophy-stat-lbl", "global")
+              ),
+              tags$div(
+                tags$span(class = "trophy-stat-num", r$n_user_obs),
+                tags$span(class = "trophy-stat-lbl", "yours")
+              )
+            )
+          )
+        )
+      )
+    })
+    do.call(fluidRow, cards)
+  })
+
+  # ── Plotly scatter: rarity vs. effort ──────────────────────────────────────
+  # x = global obs (log), y = your obs count, one point per taxon, color by
+  # iconic group. The interesting quadrant is bottom-left: globally rare AND
+  # seen by you only a handful of times.
+  output$rarity_scatter <- renderPlotly({
+    df <- rv$rarity_df
+    req(df, nrow(df) > 0)
+
+    df <- df %>%
+      mutate(
+        iconic_group = ifelse(is.na(iconic) | !nzchar(iconic),
+                              "Unknown", iconic),
+        common_disp  = coalesce(common_name, sci_name, "Unknown"),
+        taxon_url    = paste0("https://www.inaturalist.org/taxa/", taxon_id),
+        your_obs_url = paste0(
+          "https://www.inaturalist.org/observations?taxon_id=", taxon_id,
+          "&user_id=", rv$username,
+          if (rv$quality_grade != "any")
+            paste0("&quality_grade=", rv$quality_grade) else ""
+        ),
+        hover_txt = paste0(
+          "<b>", common_disp, "</b><br>",
+          "<i>", coalesce(sci_name, ""), "</i><br>",
+          "🌍 Global obs: <b>", format(global_count, big.mark = ","), "</b><br>",
+          "🔢 Your obs: <b>", n_user_obs, "</b><br>",
+          "🏷️ Group: ", iconic_group, "<br>",
+          "🏅 Rarity rank: #", rank
+        )
+      )
+
+    # Order legend so the most-common groups (most points) appear first.
+    group_order <- df %>% count(iconic_group, sort = TRUE) %>% pull(iconic_group)
+    palette     <- ICONIC_COLORS[group_order]
+    palette[is.na(palette)] <- "#7090a0"
+
+    p <- plot_ly(source = "rarity_scatter") %>%
+      event_register("plotly_click")
+
+    for (grp in group_order) {
+      sub <- df %>% filter(iconic_group == grp)
+      p <- p %>% add_markers(
+        data       = sub,
+        x          = ~global_count,
+        y          = ~n_user_obs,
+        name       = grp,
+        customdata = ~paste(taxon_id, taxon_url, your_obs_url,
+                            common_disp, sep = "|"),
+        text       = ~hover_txt,
+        hoverinfo  = "text",
+        marker     = list(
+          size    = 9,
+          color   = unname(palette[grp]),
+          opacity = 0.78,
+          line    = list(color = "rgba(255,255,255,0.18)", width = 0.5)
+        )
+      )
+    }
+
+    p %>% layout(
+      paper_bgcolor = "#172030",
+      plot_bgcolor  = "#0f1820",
+      font          = list(color = "#dde0e4",
+                           family = "'Segoe UI', Arial, sans-serif"),
+      xaxis = list(
+        title     = "Global Observations (log₁₀)",
+        type      = "log",
+        gridcolor = "#1e2d3d",
+        zeroline  = FALSE,
+        tickfont  = list(color = "#7090a0")
+      ),
+      yaxis = list(
+        title     = "Your Observations of This Taxon",
+        type      = if (max(df$n_user_obs, na.rm = TRUE) > 20) "log" else "linear",
+        gridcolor = "#1e2d3d",
+        zeroline  = FALSE,
+        tickfont  = list(color = "#7090a0")
+      ),
+      legend = list(
+        bgcolor    = "rgba(11,16,23,0.6)",
+        bordercolor = "#233040", borderwidth = 1,
+        font       = list(color = "#b0c090", size = 11),
+        itemsizing = "constant"
+      ),
+      margin     = list(l = 70, r = 30, t = 20, b = 60),
+      hoverlabel = list(
+        bgcolor     = "#0b1017",
+        bordercolor = COL_GREEN,
+        font        = list(color = "#dde0e4", size = 12)
+      )
+    ) %>%
+      config(displayModeBar = FALSE)
+  })
+
   # ── Plotly lollipop chart ──────────────────────────────────────────────────
   output$rarity_plot <- renderPlotly({
     req(chart_data())
@@ -944,12 +1194,9 @@ server <- function(input, output, session) {
   })
 
   # ── Click-a-dot: open modal with links (hover tooltips disappear too fast) ─
-  observeEvent(event_data("plotly_click", source = "rarity_plot"), {
-    ev <- event_data("plotly_click", source = "rarity_plot")
-    if (is.null(ev) || is.null(ev$customdata)) return()
-    parts <- strsplit(as.character(ev$customdata), "|", fixed = TRUE)[[1]]
-    if (length(parts) < 4) return()
-
+  # Same modal for both the lollipop and the scatter — they share customdata
+  # encoding "taxon_id|taxon_url|your_obs_url|display_name".
+  show_taxon_modal <- function(parts) {
     showModal(modalDialog(
       title = tags$span(style = paste0("color:", COL_GREEN, ";"), parts[4]),
       easyClose = TRUE,
@@ -972,7 +1219,19 @@ server <- function(input, output, session) {
         )
       )
     ))
-  })
+  }
+
+  handle_plotly_click <- function(src) {
+    ev <- event_data("plotly_click", source = src)
+    if (is.null(ev) || is.null(ev$customdata)) return()
+    parts <- strsplit(as.character(ev$customdata), "|", fixed = TRUE)[[1]]
+    if (length(parts) >= 4) show_taxon_modal(parts)
+  }
+
+  observeEvent(event_data("plotly_click", source = "rarity_plot"),
+               handle_plotly_click("rarity_plot"))
+  observeEvent(event_data("plotly_click", source = "rarity_scatter"),
+               handle_plotly_click("rarity_scatter"))
 
   # ── DT rarity table ────────────────────────────────────────────────────────
   output$rarity_table <- renderDT({
