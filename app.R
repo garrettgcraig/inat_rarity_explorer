@@ -215,8 +215,20 @@ dark_css <- sprintf('
   .skin-black .main-header .navbar {
     background-color: #0b1017 !important;
     border-bottom: 2px solid %1$s !important;
+    min-height: 50px !important;
+    height: 50px !important;
+    box-sizing: border-box !important;
   }
   .skin-black .main-header .logo { color: #dde0e4 !important; font-weight: 700; }
+  /* Kill the boxed look on the hamburger so its borders don't fight the
+     header underline. */
+  .skin-black .main-header .navbar .sidebar-toggle,
+  .skin-black .main-header .navbar .sidebar-toggle:hover,
+  .skin-black .main-header .navbar .sidebar-toggle:focus {
+    background: transparent !important;
+    border: none !important;
+    color: %1$s !important;
+  }
   .skin-black .sidebar a { color: #b0c8a0 !important; }
 
   /* Boxes */
@@ -356,12 +368,17 @@ ui <- dashboardPage(
 
       actionButton(
         "fetch_btn",
-        label = tags$span(icon("seedling"), "  Find My Rarest"),
+        label = tags$span(
+          style = paste0("display:inline-flex; align-items:center;",
+                         " justify-content:center; gap:8px; width:100%;"),
+          icon("seedling"), "Find My Rarest"
+        ),
         width = "100%",
         style = paste0(
           "background:", COL_GREEN, "; border-color:#5a8800; color:#fff;",
           "font-weight:700; font-size:15px; padding:10px 0;",
-          "border-radius:6px; letter-spacing:.3px; width:100%;"
+          "border-radius:6px; letter-spacing:.3px; width:100%;",
+          "text-align:center;"
         )
       ),
 
