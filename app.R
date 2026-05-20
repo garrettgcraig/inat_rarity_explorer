@@ -220,8 +220,8 @@ dark_css <- sprintf('
     box-sizing: border-box !important;
   }
   .skin-black .main-header .logo { color: #dde0e4 !important; font-weight: 700; }
-  /* Kill the boxed look on the hamburger so its borders don't fight the
-     header underline. */
+  /* Kill the boxed look on the hamburger so its borders do not fight
+     the header underline. */
   .skin-black .main-header .navbar .sidebar-toggle,
   .skin-black .main-header .navbar .sidebar-toggle:hover,
   .skin-black .main-header .navbar .sidebar-toggle:focus {
