@@ -231,7 +231,7 @@ dark_css <- sprintf('
     background-color: #111922 !important; color: #dde0e4;
   }
   .skin-black .main-sidebar { background-color: #0b1017 !important; }
-  /* Give the sidebar symmetric horizontal padding so 100%-width controls
+  /* Give the sidebar symmetric horizontal padding so full-width controls
      (button, slider, input) sit centered with equal margins on both sides. */
   .skin-black .main-sidebar .sidebar { padding: 12px 15px !important; }
   .skin-black .main-header .logo,
