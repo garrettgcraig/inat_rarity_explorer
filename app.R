@@ -330,6 +330,45 @@ dark_css <- sprintf('
   .trophy-card a { text-decoration: none !important; color: inherit !important; }
   .trophy-card a:hover { color: inherit !important; }
 
+  /* tabBox (shinydashboard nav-tabs + tab-content) — dark theme overrides */
+  .nav-tabs-custom { background: #172030 !important;
+    border-radius: 8px !important; box-shadow: 0 3px 12px rgba(0,0,0,.45) !important;
+    border: 1px solid #233040 !important; margin-bottom: 18px; }
+  .nav-tabs-custom > .nav-tabs {
+    background: #0b1017 !important;
+    border-bottom: 1px solid #233040 !important;
+    margin: 0 !important;
+  }
+  .nav-tabs-custom > .nav-tabs > li > a,
+  .nav-tabs-custom > .nav-tabs > li > a:hover,
+  .nav-tabs-custom > .nav-tabs > li > a:focus {
+    background: transparent !important;
+    color: #8fa0a8 !important;
+    border: none !important;
+    border-bottom: 2px solid transparent !important;
+  }
+  .nav-tabs-custom > .nav-tabs > li > a:hover { color: #dde0e4 !important; }
+  .nav-tabs-custom > .nav-tabs > li.active > a,
+  .nav-tabs-custom > .nav-tabs > li.active > a:hover,
+  .nav-tabs-custom > .nav-tabs > li.active > a:focus {
+    color: %1$s !important;
+    background: #172030 !important;
+    border-top: none !important;
+    border-bottom: 2px solid %1$s !important;
+    border-left: none !important;
+    border-right: none !important;
+  }
+  .nav-tabs-custom > .nav-tabs > li.header {
+    color: #c8d8b0 !important;
+    background: transparent !important;
+    font-weight: 600;
+  }
+  .nav-tabs-custom > .tab-content {
+    background: #172030 !important;
+    color: #dde0e4 !important;
+    border-radius: 0 0 8px 8px !important;
+  }
+
   /* Boxes */
   .box {
     background-color: #172030 !important;
