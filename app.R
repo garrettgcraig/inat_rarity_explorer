@@ -254,7 +254,21 @@ dark_css <- sprintf('
   }
   .skin-black .sidebar a { color: #b0c8a0 !important; }
 
-  /* Trophy case cards (top-5 rarest) */
+  /* Trophy case cards (top-5 rarest) — 5 in one row via flex, capped width */
+  .trophy-row {
+    display: flex;
+    flex-wrap: nowrap;     /* keep all 5 in a single row */
+    gap: 14px;
+    justify-content: center;
+    align-items: stretch;
+  }
+  .trophy-cell {
+    flex: 1 1 0;           /* 5 equal-width children */
+    min-width: 0;
+    max-width: 210px;
+    text-decoration: none !important;
+    color: inherit !important;
+  }
   .trophy-card {
     background: linear-gradient(160deg, #1c2838 0%%, #131c28 100%%);
     border: 1px solid #2c4030;
@@ -265,6 +279,8 @@ dark_css <- sprintf('
     height: 100%%;
     box-shadow: 0 2px 10px rgba(0,0,0,.35);
     position: relative;
+    max-width: 210px;
+    margin: 0 auto;       /* center within its bootstrap column */
   }
   .trophy-card:hover {
     transform: translateY(-2px);
@@ -967,34 +983,35 @@ server <- function(input, output, session) {
       }
       common   <- coalesce(r$common_name, r$sci_name, "Unknown")
       sci      <- coalesce(r$sci_name, "")
-      column(
-        width = 12 / 5,   # 5 cards across on desktop
-        tags$a(
-          href = build_url(r), target = "_blank",
+      # Bootstrap columns require integer widths (1–12); 12/5 isn't valid and
+      # was breaking the row. Use a flex container with 5 equal-width children
+      # instead so all five always sit on one row.
+      tags$a(
+        href = build_url(r), target = "_blank",
+        class = "trophy-cell",
+        tags$div(
+          class = "trophy-card",
+          tags$div(class = "trophy-rank", paste0("#", r$rank)),
+          photo,
+          tags$div(class = "trophy-name",
+                   tools::toTitleCase(tolower(common))),
+          tags$div(class = "trophy-sci", tags$em(sci)),
           tags$div(
-            class = "trophy-card",
-            tags$div(class = "trophy-rank", paste0("#", r$rank)),
-            photo,
-            tags$div(class = "trophy-name",
-                     tools::toTitleCase(tolower(common))),
-            tags$div(class = "trophy-sci", tags$em(sci)),
+            class = "trophy-stats",
             tags$div(
-              class = "trophy-stats",
-              tags$div(
-                tags$span(class = "trophy-stat-num",
-                          format(r$global_count, big.mark = ",")),
-                tags$span(class = "trophy-stat-lbl", "global")
-              ),
-              tags$div(
-                tags$span(class = "trophy-stat-num", r$n_user_obs),
-                tags$span(class = "trophy-stat-lbl", "yours")
-              )
+              tags$span(class = "trophy-stat-num",
+                        format(r$global_count, big.mark = ",")),
+              tags$span(class = "trophy-stat-lbl", "global")
+            ),
+            tags$div(
+              tags$span(class = "trophy-stat-num", r$n_user_obs),
+              tags$span(class = "trophy-stat-lbl", "yours")
             )
           )
         )
       )
     })
-    do.call(fluidRow, cards)
+    tags$div(class = "trophy-row", cards)
   })
 
   # ── Plotly scatter: rarity vs. effort ──────────────────────────────────────
