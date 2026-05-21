@@ -226,7 +226,10 @@ obs_list_to_df <- function(obs_list) {
 }
 
 # ── CSS ────────────────────────────────────────────────────────────────────────
-dark_css <- sprintf('
+# Note: sprintf has an 8192-byte format-string limit, which this stylesheet
+# has outgrown. Use gsub to splice in COL_GREEN (and to collapse the legacy
+# %% escapes left over from the old sprintf template).
+dark_css <- '
   body, .content-wrapper, .right-side {
     background-color: #111922 !important; color: #dde0e4;
   }
@@ -466,7 +469,9 @@ dark_css <- sprintf('
   }
   .stat-lbl { color: #6a8090; }
   .stat-val { color: #a0c878; font-weight: bold; }
-', COL_GREEN)
+'
+dark_css <- gsub("%1$s", COL_GREEN, dark_css, fixed = TRUE)
+dark_css <- gsub("%%",   "%",       dark_css, fixed = TRUE)
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
 ui <- dashboardPage(
