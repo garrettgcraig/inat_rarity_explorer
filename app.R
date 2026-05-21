@@ -955,8 +955,12 @@ server <- function(input, output, session) {
 
     cards <- lapply(seq_len(nrow(top)), function(i) {
       r        <- top[i, ]
-      photo    <- if (!is.na(r$thumb_url) && nzchar(r$thumb_url)) {
-        tags$img(src = r$thumb_url, class = "trophy-photo",
+      # iNat's `url` field is the 75×75 "square" thumbnail. Swap to "medium"
+      # (500×500) for the trophy card so it does not pixelate when stretched.
+      hires_url <- if (!is.na(r$thumb_url) && nzchar(r$thumb_url))
+        sub("/square\\.", "/medium.", r$thumb_url) else NA_character_
+      photo    <- if (!is.na(hires_url) && nzchar(hires_url)) {
+        tags$img(src = hires_url, class = "trophy-photo", loading = "lazy",
                  onerror = "this.outerHTML='<div class=\"trophy-photo-fallback\">📷</div>'")
       } else {
         tags$div(class = "trophy-photo-fallback", "📷")
