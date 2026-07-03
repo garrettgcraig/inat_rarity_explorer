@@ -48,6 +48,33 @@ ICONIC_COLORS <- c(
   Unknown      = "#6080a0"
 )
 
+# iNat's iconic_taxon_name mixes kingdom-level groups (Plantae, Fungi…) with
+# class-level animal groups (Aves, Insecta…). Map each iconic value to its
+# kingdom so we can offer a Kingdom filter, then a Class filter within Animalia.
+ICONIC_TO_KINGDOM <- c(
+  Plantae = "Plantae", Fungi = "Fungi", Protozoa = "Protozoa",
+  Chromista = "Chromista",
+  Animalia = "Animalia", Amphibia = "Animalia", Reptilia = "Animalia",
+  Aves = "Animalia", Mammalia = "Animalia", Actinopterygii = "Animalia",
+  Mollusca = "Animalia", Arachnida = "Animalia", Insecta = "Animalia"
+)
+KINGDOM_ORDER <- c("Animalia", "Plantae", "Fungi", "Chromista",
+                   "Protozoa", "Unknown")
+
+# Friendly labels for the animal-class filter (value = iconic code). "Animalia"
+# as an iconic means an animal with no more specific iconic class.
+ANIMAL_CLASS_LABELS <- c(
+  Aves           = "Birds (Aves)",
+  Mammalia       = "Mammals (Mammalia)",
+  Reptilia       = "Reptiles (Reptilia)",
+  Amphibia       = "Amphibians (Amphibia)",
+  Actinopterygii = "Ray-finned fishes (Actinopterygii)",
+  Mollusca       = "Mollusks (Mollusca)",
+  Arachnida      = "Arachnids (Arachnida)",
+  Insecta        = "Insects (Insecta)",
+  Animalia       = "Other animals"
+)
+
 # Concurrency knobs. iNat allows up to 60 req/min — stay well below.
 CONCURRENCY_PAGES   <- 4L    # pages of /observations fired in parallel
 CONCURRENCY_TAXA    <- 3L    # /taxa batches fired in parallel
@@ -621,6 +648,35 @@ ui <- dashboardPage(
 
       tags$hr(style = "border-color:#233040; margin:15px 0;"),
 
+      # ── Taxonomic filters (apply to every view) ──
+      conditionalPanel(
+        condition = "output.has_data",
+        tags$label(style = "color:#8fb070; font-size:12px; font-weight:600;",
+                   "Kingdom"),
+        selectizeInput(
+          "kingdom_filter", NULL, choices = NULL, multiple = TRUE,
+          width = "100%",
+          options = list(placeholder = "All kingdoms",
+                         plugins = list("remove_button"))
+        ),
+        conditionalPanel(
+          condition = paste0(
+            "input.kingdom_filter == null || input.kingdom_filter.length == 0",
+            " || input.kingdom_filter.indexOf('Animalia') > -1"),
+          div(style = "margin-top:6px;",
+            tags$label(style = "color:#8fb070; font-size:12px; font-weight:600;",
+                       "Class (within Animalia)"),
+            selectizeInput(
+              "class_filter", NULL, choices = NULL, multiple = TRUE,
+              width = "100%",
+              options = list(placeholder = "All animal classes",
+                             plugins = list("remove_button"))
+            )
+          )
+        ),
+        tags$hr(style = "border-color:#233040; margin:15px 0;")
+      ),
+
       uiOutput("sidebar_stats")
     )
   ),
@@ -1120,12 +1176,43 @@ server <- function(input, output, session) {
   })
 
 
-  # ── Reactive: filtered chart data ──────────────────────────────────────────
-  chart_data <- reactive({
-    req(rv$rarity_df)
+  # ── Base data: apply the taxonomic (kingdom/class) filters globally ─────────
+  # Every view (trophy, both charts, table) derives from this, so the Kingdom
+  # and Class filters reshape the whole analysis. Ranks are preserved from the
+  # full result set — a filtered "#3" is still your 3rd-rarest overall.
+  base_df <- reactive({
     df <- rv$rarity_df
+    req(df)
+    df$kingdom <- unname(ICONIC_TO_KINGDOM[df$iconic])
+    df$kingdom[is.na(df$kingdom)] <- "Unknown"
+
+    kf <- input$kingdom_filter
+    if (length(kf) > 0) df <- df[df$kingdom %in% kf, , drop = FALSE]
+
+    # Class filter refines Animalia only; rows in other kingdoms pass through.
+    cf <- input$class_filter
+    if (length(cf) > 0)
+      df <- df[df$kingdom != "Animalia" | df$iconic %in% cf, , drop = FALSE]
+    df
+  })
+
+  # ── Reactive: filtered chart data (top-N lollipop) ──────────────────────────
+  chart_data <- reactive({
+    df <- base_df()
+    req(nrow(df) > 0)
     if (input$hide_unnamed) df <- df %>% filter(!is.na(common_name) & nzchar(common_name))
     head(df, input$top_n)
+  })
+
+  # ── Reactive: table data (base + hide-unnamed + place). CSV mirrors this. ───
+  table_df <- reactive({
+    df <- base_df()
+    req(df)
+    if (isTRUE(input$hide_unnamed))
+      df <- df %>% filter(!is.na(common_name) & nzchar(coalesce(common_name, "")))
+    if (length(input$place_filter) > 0)
+      df <- df %>% filter(place %in% input$place_filter)
+    df
   })
 
   # ── Signal for conditionalPanel ────────────────────────────────────────────
@@ -1134,14 +1221,34 @@ server <- function(input, output, session) {
   })
   outputOptions(output, "has_data", suspendWhenHidden = FALSE)
 
-  # Populate the table's place filter with the distinct places in the results
-  # (server-side selectize so it stays snappy even with hundreds of places).
+  # Populate the filter dropdowns from the current results (server-side
+  # selectize so they stay snappy even with hundreds of distinct places).
   observeEvent(rv$rarity_df, {
     df <- rv$rarity_df
+
     places <- if (is.null(df)) character(0) else
       sort(unique(df$place[!is.na(df$place) & nzchar(df$place)]))
     updateSelectizeInput(session, "place_filter",
                          choices = places, selected = character(0),
+                         server = TRUE)
+
+    # Kingdoms present, in canonical order.
+    kingdoms <- if (is.null(df)) character(0) else {
+      ks <- unname(ICONIC_TO_KINGDOM[df$iconic]); ks[is.na(ks)] <- "Unknown"
+      intersect(KINGDOM_ORDER, unique(ks))
+    }
+    updateSelectizeInput(session, "kingdom_filter",
+                         choices = kingdoms, selected = character(0),
+                         server = TRUE)
+
+    # Animal classes present (value = iconic code, label = friendly name).
+    classes <- if (is.null(df)) character(0) else {
+      animal_iconic <- df$iconic[unname(ICONIC_TO_KINGDOM[df$iconic]) %in% "Animalia"]
+      intersect(names(ANIMAL_CLASS_LABELS), unique(animal_iconic))
+    }
+    class_choices <- setNames(classes, unname(ANIMAL_CLASS_LABELS[classes]))
+    updateSelectizeInput(session, "class_filter",
+                         choices = class_choices, selected = character(0),
                          server = TRUE)
   }, ignoreNULL = FALSE)
 
@@ -1214,7 +1321,7 @@ server <- function(input, output, session) {
 
   # ── Trophy case (top 5 rarest as photo cards) ──────────────────────────────
   output$trophy_case <- renderUI({
-    df <- rv$rarity_df
+    df <- base_df()
     req(df, nrow(df) > 0)
     top <- head(df, 5)
 
@@ -1273,7 +1380,7 @@ server <- function(input, output, session) {
   # iconic group. The interesting quadrant is bottom-left: globally rare AND
   # seen by you only a handful of times.
   output$rarity_scatter <- renderPlotly({
-    df <- rv$rarity_df
+    df <- base_df()
     req(df, nrow(df) > 0)
     obs_count_label <- if (identical(rv$subject_kind, "project"))
       "Obs in project" else "Your obs"
@@ -1510,7 +1617,7 @@ server <- function(input, output, session) {
   observeEvent(event_data("plotly_click", source = "rarity_scatter"),
                handle_plotly_click("rarity_scatter"))
 
-  # ── CSV export of the full ranked table ────────────────────────────────────
+  # ── CSV export — mirrors exactly what the (filtered) table shows ────────────
   output$download_csv <- downloadHandler(
     filename = function() {
       sprintf("inat-rarest-%s-%s.csv",
@@ -1519,7 +1626,7 @@ server <- function(input, output, session) {
               Sys.Date())
     },
     content = function(file) {
-      df <- rv$rarity_df
+      df <- table_df()
       req(df, nrow(df) > 0)
       out <- df %>%
         transmute(
@@ -1527,6 +1634,7 @@ server <- function(input, output, session) {
           common_name    = coalesce(common_name, ""),
           scientific_name = coalesce(sci_name, ""),
           taxon_id,
+          kingdom        = coalesce(kingdom, ""),
           iconic_group   = coalesce(iconic, ""),
           observed_on    = coalesce(obs_date, ""),
           place          = coalesce(place, ""),
@@ -1540,13 +1648,8 @@ server <- function(input, output, session) {
 
   # ── DT rarity table ────────────────────────────────────────────────────────
   output$rarity_table <- renderDT({
-    req(rv$rarity_df)
-
-    df <- rv$rarity_df
-    if (input$hide_unnamed)
-      df <- df %>% filter(!is.na(common_name) & nzchar(coalesce(common_name, "")))
-    if (length(input$place_filter) > 0)
-      df <- df %>% filter(place %in% input$place_filter)
+    df <- table_df()
+    req(df)
 
     is_project <- identical(rv$subject_kind, "project")
     obs_col_name <- if (is_project) "In-Project Obs" else "Your Obs"
