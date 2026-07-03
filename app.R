@@ -130,17 +130,19 @@ inat_multi_get_json <- function(urls, max_concurrent = 4L, timeout = 60L) {
 }
 
 #' Build an /observations URL with the fields filter and optional date window.
-build_obs_url <- function(username, page, per_page = 200L,
+#' Filter by either a user (`username`) or a `project_id` — exactly one is set.
+build_obs_url <- function(username = NULL, page, per_page = 200L,
                           d1 = NULL, d2 = NULL,
                           quality_grade = "research",
-                          id_above = NULL) {
+                          id_above = NULL, project_id = NULL) {
   qs <- list(
-    user_login = username,
     per_page   = per_page,
     order      = "asc",
     order_by   = "id",
     fields     = OBS_FIELDS
   )
+  if (!is.null(username))   qs$user_login <- username
+  if (!is.null(project_id)) qs$project_id <- project_id
   # Prefer id_above cursor when supplied (works past the page=1..50 cap);
   # otherwise fall back to page-based pagination.
   if (!is.null(id_above)) qs$id_above <- id_above
@@ -182,6 +184,17 @@ check_user_exists <- function(username) {
   any(sapply(parsed$results, function(u) {
     tolower(chr_val(u$login)) == tolower(username)
   }))
+}
+
+#' Resolve a project name to its numeric id via the autocomplete endpoint.
+#' Returns list(id, title) for the best match, or NULL if none found.
+resolve_project <- function(name) {
+  resp <- safe_get(paste0(BASE_URL, "/projects/autocomplete"), list(q = name))
+  parsed <- parse_resp(resp)
+  if (is.null(parsed) || length(parsed$results) == 0) return(NULL)
+  r <- parsed$results[[1]]
+  if (is.null(r$id)) return(NULL)
+  list(id = as.character(r$id), title = chr_val(r$title) %||% name)
 }
 
 # (Legacy synchronous fetchers removed — the state machine in server() now
@@ -397,6 +410,37 @@ dark_css <- '
   }
   .box-title { font-size: 15px !important; font-weight: 600 !important; }
 
+  /* Download button is an <a>, so the generic "a { color: green !important }"
+     rule below beats its inline white text — force white in every state. */
+  #download_csv, #download_csv:link, #download_csv:visited,
+  #download_csv:hover, #download_csv:focus, #download_csv:active {
+    color: #ffffff !important;
+    background: %1$s !important;
+    border-color: #5a8800 !important;
+  }
+  #download_csv .fa, #download_csv .glyphicon { color: #ffffff !important; }
+
+  /* Selectize (place filter) — match the dark theme */
+  .selectize-input {
+    background: #0b1017 !important; border: 1px solid #2a3a4a !important;
+    color: #dde0e4 !important; border-radius: 5px !important;
+    box-shadow: none !important;
+  }
+  .selectize-input.focus { border-color: %1$s !important;
+    box-shadow: 0 0 0 2px rgba(116,172,0,.3) !important; }
+  .selectize-input input { color: #dde0e4 !important; }
+  .selectize-input .item {
+    background: %1$s !important; color: #0b1017 !important;
+    border-radius: 4px !important; font-weight: 600;
+  }
+  .selectize-input .item .remove { border-color: rgba(0,0,0,.2) !important; }
+  .selectize-dropdown {
+    background: #172030 !important; color: #dde0e4 !important;
+    border: 1px solid #2a3a4a !important;
+  }
+  .selectize-dropdown .active { background: #24405a !important; color: #fff !important; }
+  .selectize-control.multi .selectize-input > div { color: #0b1017 !important; }
+
   /* Inputs */
   .form-control {
     background: #0b1017 !important; border: 1px solid #2a3a4a !important;
@@ -498,12 +542,40 @@ ui <- dashboardPage(
     div(style = "padding: 18px 16px;",
 
       tags$label(
-        style = "color:#8fb070; font-size:13px; font-weight:600;",
-        "iNaturalist Username"
+        style = "color:#8fb070; font-size:12px; font-weight:600;",
+        "Search by"
       ),
-      div(style = "margin-top:5px; margin-bottom:14px;",
-        textInput("username", NULL,
-                  placeholder = "e.g. hommedeterre", width = "100%")
+      radioButtons(
+        "search_mode", NULL,
+        choices  = c("A user's observations" = "user",
+                     "A project's observations" = "project"),
+        selected = "user", inline = FALSE
+      ),
+
+      conditionalPanel(
+        condition = "input.search_mode == 'user'",
+        tags$label(
+          style = "color:#8fb070; font-size:13px; font-weight:600;",
+          "iNaturalist Username"
+        ),
+        div(style = "margin-top:5px; margin-bottom:14px;",
+          textInput("username", NULL,
+                    placeholder = "e.g. hommedeterre", width = "100%")
+        )
+      ),
+
+      conditionalPanel(
+        condition = "input.search_mode == 'project'",
+        tags$label(
+          style = "color:#8fb070; font-size:13px; font-weight:600;",
+          "iNaturalist Project"
+        ),
+        div(style = "margin-top:5px; margin-bottom:4px;",
+          textInput("project", NULL,
+                    placeholder = "e.g. Snakes of Texas", width = "100%")
+        ),
+        div(style = "font-size:11px; color:#5a7080; margin-bottom:14px;",
+            "Type a project name; the closest match is used.")
       ),
 
       div(
@@ -602,13 +674,21 @@ ui <- dashboardPage(
           title = tags$span(icon("table"), "  Full Rarity Table — All Unique Taxa"),
           width = 12,
           div(
-            style = paste0("margin-bottom:10px; display:flex; gap:12px;",
-                           " align-items:center; justify-content:space-between;",
+            style = paste0("margin-bottom:10px; display:flex; gap:14px;",
+                           " align-items:flex-end; justify-content:space-between;",
                            " flex-wrap:wrap;"),
             div(
-              style = "font-size:13px; color:#6a8090; flex:1 1 320px;",
-              "Click any thumbnail to view the observation on iNaturalist. ",
-              "Table includes all ranked taxa; chart shows the top-N slider selection."
+              style = "flex:1 1 260px; min-width:220px;",
+              tags$label(style = "color:#8fb070; font-size:12px; font-weight:600;",
+                         "Filter by place"),
+              selectizeInput(
+                "place_filter", NULL, choices = NULL, multiple = TRUE,
+                width = "100%",
+                options = list(
+                  placeholder = "All places — type to search…",
+                  plugins = list("remove_button")
+                )
+              )
             ),
             downloadButton(
               "download_csv", "Download CSV",
@@ -616,6 +696,11 @@ ui <- dashboardPage(
                              " border-color:#5a8800; font-weight:600;",
                              " border-radius:6px; white-space:nowrap;")
             )
+          ),
+          div(
+            style = "margin-bottom:10px; font-size:12.5px; color:#6a8090;",
+            "Click any thumbnail to view the observation on iNaturalist. ",
+            "Table includes all ranked taxa; chart shows the top-N slider selection."
           ),
           withSpinner(
             DTOutput("rarity_table"),
@@ -634,6 +719,9 @@ server <- function(input, output, session) {
     rarity_df     = NULL,    # final ranked data frame — cached for session
     username      = NULL,
     quality_grade = "research",  # grade used for the current results
+    subject_label = NULL,    # "hommedeterre" or a project title, for display
+    subject_kind  = "user",  # "user" | "project"
+    link_param    = "",      # query fragment for per-taxon obs links
     n_total_obs   = 0,
     n_taxa        = 0,
     status        = "idle",  # idle | fetching | done | error
@@ -676,7 +764,7 @@ server <- function(input, output, session) {
     fs$taxa_df   <- NULL
     fs$counts    <- NULL
     fs$batches   <- NULL
-    enable("fetch_btn"); enable("username")
+    enable("fetch_btn"); enable("username"); enable("project")
   }
 
   # ── Stage handlers ────────────────────────────────────────────────────────
@@ -687,8 +775,32 @@ server <- function(input, output, session) {
   # runs (as a fallback, to give a precise error) when zero results come back.
   step_count <- function() {
     fs$per_page <- 200L
-    url  <- build_obs_url(fs$username, page = 1L, per_page = fs$per_page,
-                          quality_grade = fs$qg)
+    qg_frag <- if (fs$qg != "any") paste0("&quality_grade=", fs$qg) else ""
+
+    # Resolve the subject (user login vs. project name) and set up the link
+    # fragment used to deep-link each taxon's observations back to iNaturalist.
+    if (fs$mode == "project") {
+      proj <- tryCatch(resolve_project(fs$subject), error = function(e) NULL)
+      if (is.null(proj)) {
+        finish_error(sprintf(
+          "No iNaturalist project matched '%s'. Try a different name.",
+          fs$subject))
+        return()
+      }
+      fs$project_id    <- proj$id
+      fs$subject_label <- proj$title
+      fs$link_param    <- paste0("project_id=", proj$id, qg_frag)
+      url <- build_obs_url(project_id = fs$project_id, page = 1L,
+                           per_page = fs$per_page, quality_grade = fs$qg)
+    } else {
+      fs$subject_label <- fs$subject
+      fs$link_param    <- paste0("user_id=",
+                                 utils::URLencode(fs$subject, reserved = TRUE),
+                                 qg_frag)
+      url <- build_obs_url(username = fs$subject, page = 1L,
+                           per_page = fs$per_page, quality_grade = fs$qg)
+    }
+
     resp <- inat_multi_get_json(url, max_concurrent = 1L)[[1]]
     if (is.null(resp)) {
       finish_error("Could not connect to the iNaturalist API.")
@@ -696,17 +808,23 @@ server <- function(input, output, session) {
     }
     total <- as.integer(resp$total_results %||% 0)
     if (total == 0) {
-      # Distinguish "no such user" from "user has no matching observations".
-      exists <- isTRUE(tryCatch(check_user_exists(fs$username),
-                                error = function(e) FALSE))
-      if (!exists) {
+      if (fs$mode == "project") {
         finish_error(sprintf(
-          "User '%s' was not found on iNaturalist. Check the spelling and try again.",
-          fs$username))
+          "No %sobservations found in project '%s'.",
+          if (fs$qg == "research") "research-grade " else "", fs$subject_label))
       } else {
-        finish_error(sprintf(
-          "No %sobservations found for '%s'.",
-          if (fs$qg == "research") "research-grade " else "", fs$username))
+        # Distinguish "no such user" from "user has no matching observations".
+        exists <- isTRUE(tryCatch(check_user_exists(fs$subject),
+                                  error = function(e) FALSE))
+        if (!exists) {
+          finish_error(sprintf(
+            "User '%s' was not found on iNaturalist. Check the spelling and try again.",
+            fs$subject))
+        } else {
+          finish_error(sprintf(
+            "No %sobservations found for '%s'.",
+            if (fs$qg == "research") "research-grade " else "", fs$subject))
+        }
       }
       return()
     }
@@ -745,6 +863,18 @@ server <- function(input, output, session) {
     schedule(step_fetch_page)
   }
 
+  # Build an /observations page URL for the current subject (user or project).
+  obs_page_url <- function(page = NULL, id_above = NULL) {
+    if (fs$mode == "project")
+      build_obs_url(project_id = fs$project_id, page = page,
+                    per_page = fs$per_page, quality_grade = fs$qg,
+                    id_above = id_above)
+    else
+      build_obs_url(username = fs$subject, page = page,
+                    per_page = fs$per_page, quality_grade = fs$qg,
+                    id_above = id_above)
+  }
+
   # Handle a parallel batch of observation pages (cursor or page-based).
   # For page-based: fires CONCURRENCY_PAGES requests at once.
   # For cursor: must run sequentially since each id_above depends on the prior
@@ -753,9 +883,7 @@ server <- function(input, output, session) {
     if (fs$use_cursor) {
       # Sequential id_above cursor: one page per tick. Still benefits from
       # `fields=` and keep-alive within inat_multi_get_json's pool.
-      url <- build_obs_url(fs$username, page = NULL, per_page = fs$per_page,
-                           quality_grade = fs$qg,
-                           id_above = fs$id_above)
+      url <- obs_page_url(id_above = fs$id_above)
       resp <- inat_multi_get_json(url, max_concurrent = 1L)[[1]]
       results <- if (!is.null(resp)) resp$results else list()
       if (length(results) == 0L) {
@@ -791,10 +919,7 @@ server <- function(input, output, session) {
       fs$cur_page,
       min(fs$cur_page + CONCURRENCY_PAGES - 1L, fs$n_pages)
     )
-    urls <- vapply(this_batch, function(p) {
-      build_obs_url(fs$username, page = p, per_page = fs$per_page,
-                    d1 = fs$d1, d2 = fs$d2, quality_grade = fs$qg)
-    }, character(1))
+    urls <- vapply(this_batch, function(p) obs_page_url(page = p), character(1))
 
     responses <- inat_multi_get_json(urls, max_concurrent = CONCURRENCY_PAGES)
     for (resp in responses) {
@@ -820,7 +945,7 @@ server <- function(input, output, session) {
     obs_list <- if (length(fs$pages) > 0) do.call(c, fs$pages) else list()
     fs$pages <- NULL  # free memory
     if (length(obs_list) == 0) {
-      finish_error(sprintf("No observations found for '%s'.", fs$username))
+      finish_error(sprintf("No observations found for '%s'.", fs$subject_label))
       return()
     }
     fs$obs_df <- obs_list_to_df(obs_list)
@@ -907,9 +1032,11 @@ server <- function(input, output, session) {
       arrange(global_count) %>%
       mutate(rank = row_number())
 
-    rv$rarity_df  <- rarity_df
-    rv$username   <- fs$username
-    rv$status     <- "done"
+    rv$rarity_df     <- rarity_df
+    rv$subject_label <- fs$subject_label
+    rv$subject_kind  <- fs$mode
+    rv$link_param    <- fs$link_param
+    rv$status        <- "done"
     r1 <- rarity_df
     rv$status_msg <- sprintf(
       "✅ Done! %s observations · %s unique taxa ranked · rarest: %s (%s global obs)",
@@ -919,14 +1046,18 @@ server <- function(input, output, session) {
       format(r1$global_count[1], big.mark = ","))
 
     fs$taxa_df <- NULL; fs$counts <- NULL; fs$batches <- NULL
-    enable("fetch_btn"); enable("username")
+    enable("fetch_btn"); enable("username"); enable("project")
   }
 
   # ── Kick off ─────────────────────────────────────────────────────────────
-  start_fetch <- function(username, qg) {
-    username <- trimws(username %||% "")
-    if (!nzchar(username)) {
-      showNotification("Please enter an iNaturalist username.", type = "warning")
+  start_fetch <- function(subject, qg, mode = "user") {
+    subject <- trimws(subject %||% "")
+    if (!mode %in% c("user", "project")) mode <- "user"
+    if (!nzchar(subject)) {
+      showNotification(
+        if (mode == "project") "Please enter a project name."
+        else                   "Please enter an iNaturalist username.",
+        type = "warning")
       return(invisible())
     }
     if (!qg %in% c("research", "any")) qg <- "research"
@@ -935,41 +1066,56 @@ server <- function(input, output, session) {
     rv$rarity_df     <- NULL
     rv$quality_grade <- qg
     rv$status        <- "fetching"
-    rv$status_msg    <- paste0("Connecting to iNaturalist for: ", username, " ...")
+    rv$status_msg    <- sprintf("Connecting to iNaturalist for %s: %s ...",
+                                if (mode == "project") "project" else "user",
+                                subject)
 
-    fs$generation <- fs$generation + 1L
-    fs$username   <- username
-    fs$qg         <- qg
-    fs$pages      <- NULL
-    fs$obs_df     <- NULL
-    fs$taxa_df    <- NULL
-    fs$counts     <- NULL
-    fs$batches    <- NULL
+    fs$generation  <- fs$generation + 1L
+    fs$mode        <- mode
+    fs$subject     <- subject
+    fs$project_id  <- NULL
+    fs$qg          <- qg
+    fs$pages       <- NULL
+    fs$obs_df      <- NULL
+    fs$taxa_df     <- NULL
+    fs$counts      <- NULL
+    fs$batches     <- NULL
 
-    disable("fetch_btn"); disable("username")
+    disable("fetch_btn"); disable("username"); disable("project")
 
     # Reflect the active query in the URL so results are shareable/bookmarkable.
+    key <- if (mode == "project") "project" else "user"
     updateQueryString(
-      sprintf("?user=%s&grade=%s", utils::URLencode(username, reserved = TRUE), qg),
+      sprintf("?%s=%s&grade=%s", key,
+              utils::URLencode(subject, reserved = TRUE), qg),
       mode = "replace")
 
     schedule(step_count)
   }
 
   observeEvent(input$fetch_btn, {
-    start_fetch(input$username, input$quality_grade)
+    if (identical(input$search_mode, "project"))
+      start_fetch(input$project, input$quality_grade, mode = "project")
+    else
+      start_fetch(input$username, input$quality_grade, mode = "user")
   })
 
-  # Deep link: on first load, if the URL carries ?user=…, populate the sidebar
-  # controls and auto-run so a shared link reproduces someone's results.
+  # Deep link: on first load, if the URL carries ?user=… or ?project=…, populate
+  # the sidebar controls and auto-run so a shared link reproduces the results.
   observeEvent(session$clientData$url_search, once = TRUE, {
     q <- getQueryString()
-    if (!is.null(q$user) && nzchar(q$user)) {
-      grade <- if (!is.null(q$grade) && q$grade %in% c("research", "any"))
-        q$grade else "research"
+    grade <- if (!is.null(q$grade) && q$grade %in% c("research", "any"))
+      q$grade else "research"
+    if (!is.null(q$project) && nzchar(q$project)) {
+      updateRadioButtons(session, "search_mode", selected = "project")
+      updateTextInput(session, "project", value = q$project)
+      updateRadioButtons(session, "quality_grade", selected = grade)
+      start_fetch(q$project, grade, mode = "project")
+    } else if (!is.null(q$user) && nzchar(q$user)) {
+      updateRadioButtons(session, "search_mode", selected = "user")
       updateTextInput(session, "username", value = q$user)
       updateRadioButtons(session, "quality_grade", selected = grade)
-      start_fetch(q$user, grade)
+      start_fetch(q$user, grade, mode = "user")
     }
   })
 
@@ -988,6 +1134,17 @@ server <- function(input, output, session) {
   })
   outputOptions(output, "has_data", suspendWhenHidden = FALSE)
 
+  # Populate the table's place filter with the distinct places in the results
+  # (server-side selectize so it stays snappy even with hundreds of places).
+  observeEvent(rv$rarity_df, {
+    df <- rv$rarity_df
+    places <- if (is.null(df)) character(0) else
+      sort(unique(df$place[!is.na(df$place) & nzchar(df$place)]))
+    updateSelectizeInput(session, "place_filter",
+                         choices = places, selected = character(0),
+                         server = TRUE)
+  }, ignoreNULL = FALSE)
+
   # ── Status panel ───────────────────────────────────────────────────────────
   output$status_panel <- renderUI({
     switch(rv$status,
@@ -995,16 +1152,17 @@ server <- function(input, output, session) {
         class = "welcome-box",
         tags$h2("🌿 iNat Rarity Explorer"),
         tags$p(
-          "Find out which of your iNaturalist observations are the rarest on Earth, ",
-          "ranked by how few people have ever recorded that species globally."
+          "Find out which iNaturalist observations are the rarest on Earth, ",
+          "ranked by how few people have ever recorded that species globally. ",
+          "Explore a single user's finds or an entire project's."
         ),
         tags$p(tags$small(
           style = "color:#455060;",
-          "Enter your iNaturalist username in the sidebar and click ",
+          "Pick ", tags$b("a user"), " or ", tags$b("a project"),
+          " in the sidebar, enter a name, and click ",
           tags$b("Find My Rarest"), " to begin.",
           tags$br(),
-          "Only research-grade observations are included. ",
-          "Large accounts (1000+ taxa) may take a couple of minutes."
+          "Large accounts or projects (1000+ taxa) may take a little longer."
         ))
       ),
       fetching = div(
@@ -1028,8 +1186,9 @@ server <- function(input, output, session) {
     tagList(
       tags$h5(style = "color:#74ac00; margin-bottom:8px;", "📊 Session Summary"),
       div(class = "stat-row",
-          span(class = "stat-lbl", "User"),
-          span(class = "stat-val", rv$username)),
+          span(class = "stat-lbl",
+               if (identical(rv$subject_kind, "project")) "Project" else "User"),
+          span(class = "stat-val", rv$subject_label)),
       div(class = "stat-row",
           span(class = "stat-lbl", "Total obs"),
           span(class = "stat-val", format(rv$n_total_obs, big.mark = ","))),
@@ -1061,9 +1220,7 @@ server <- function(input, output, session) {
 
     build_url <- function(r) {
       paste0("https://www.inaturalist.org/observations?taxon_id=", r$taxon_id,
-             "&user_id=", rv$username,
-             if (rv$quality_grade != "any")
-               paste0("&quality_grade=", rv$quality_grade) else "")
+             "&", rv$link_param)
     }
 
     cards <- lapply(seq_len(nrow(top)), function(i) {
@@ -1118,6 +1275,8 @@ server <- function(input, output, session) {
   output$rarity_scatter <- renderPlotly({
     df <- rv$rarity_df
     req(df, nrow(df) > 0)
+    obs_count_label <- if (identical(rv$subject_kind, "project"))
+      "Obs in project" else "Your obs"
 
     df <- df %>%
       mutate(
@@ -1127,15 +1286,13 @@ server <- function(input, output, session) {
         taxon_url    = paste0("https://www.inaturalist.org/taxa/", taxon_id),
         your_obs_url = paste0(
           "https://www.inaturalist.org/observations?taxon_id=", taxon_id,
-          "&user_id=", rv$username,
-          if (rv$quality_grade != "any")
-            paste0("&quality_grade=", rv$quality_grade) else ""
+          "&", rv$link_param
         ),
         hover_txt = paste0(
           "<b>", common_disp, "</b><br>",
           "<i>", coalesce(sci_name, ""), "</i><br>",
           "🌍 Global obs: <b>", format(global_count, big.mark = ","), "</b><br>",
-          "🔢 Your obs: <b>", n_user_obs, "</b><br>",
+          "🔢 ", obs_count_label, ": <b>", n_user_obs, "</b><br>",
           "🏷️ Group: ", iconic_group, "<br>",
           "🏅 Rarity rank: #", rank
         )
@@ -1207,6 +1364,9 @@ server <- function(input, output, session) {
   # ── Plotly lollipop chart ──────────────────────────────────────────────────
   output$rarity_plot <- renderPlotly({
     req(chart_data())
+    is_project <- identical(rv$subject_kind, "project")
+    obs_count_label <- if (is_project) "Obs in project (this taxon)"
+                       else            "Your obs (this taxon)"
 
     df <- chart_data() %>%
       mutate(
@@ -1221,16 +1381,15 @@ server <- function(input, output, session) {
         taxon_url   = paste0("https://www.inaturalist.org/taxa/", taxon_id),
         your_obs_url = paste0(
           "https://www.inaturalist.org/observations?taxon_id=", taxon_id,
-          "&user_id=", rv$username,
-          if (rv$quality_grade != "any") paste0("&quality_grade=", rv$quality_grade) else ""
+          "&", rv$link_param
         ),
         hover_txt = paste0(
           "<b>", coalesce(common_name, sci_name, "Unknown"), "</b><br>",
           "<i>", coalesce(sci_name, ""), "</i><br>",
           "🌍 Global obs: <b>", format(global_count, big.mark = ","), "</b><br>",
-          "📅 Your date: ", coalesce(obs_date, "unknown"), "<br>",
+          "📅 Date: ", coalesce(obs_date, "unknown"), "<br>",
           "📍 Place: ", coalesce(place, "unknown"), "<br>",
-          "🔢 Your obs (this taxon): ", n_user_obs, "<br>",
+          "🔢 ", obs_count_label, ": ", n_user_obs, "<br>",
           "<i style='color:#8fb070;'>Click dot for links →</i>"
         )
       )
@@ -1355,7 +1514,9 @@ server <- function(input, output, session) {
   output$download_csv <- downloadHandler(
     filename = function() {
       sprintf("inat-rarest-%s-%s.csv",
-              gsub("[^A-Za-z0-9_-]", "", rv$username %||% "user"), Sys.Date())
+              gsub("[^A-Za-z0-9_-]", "",
+                   gsub("\\s+", "-", rv$subject_label %||% "results")),
+              Sys.Date())
     },
     content = function(file) {
       df <- rv$rarity_df
@@ -1384,6 +1545,11 @@ server <- function(input, output, session) {
     df <- rv$rarity_df
     if (input$hide_unnamed)
       df <- df %>% filter(!is.na(common_name) & nzchar(coalesce(common_name, "")))
+    if (length(input$place_filter) > 0)
+      df <- df %>% filter(place %in% input$place_filter)
+
+    is_project <- identical(rv$subject_kind, "project")
+    obs_col_name <- if (is_project) "In-Project Obs" else "Your Obs"
 
     tbl <- df %>%
       transmute(
@@ -1412,13 +1578,12 @@ server <- function(input, output, session) {
         Date              = coalesce(obs_date, "—"),
         Place             = coalesce(place, "—"),
         `Global Obs`      = format(global_count, big.mark = ","),
-        `Your Obs`        = sprintf(
-          '<a href="https://www.inaturalist.org/observations?taxon_id=%s&user_id=%s%s" target="_blank" title="View your observations of this taxon" style="color:#74ac00; font-weight:bold;">%s</a>',
-          taxon_id, rv$username,
-          if (rv$quality_grade != "any") paste0("&quality_grade=", rv$quality_grade) else "",
-          n_user_obs
+        obs_col           = sprintf(
+          '<a href="https://www.inaturalist.org/observations?taxon_id=%s&%s" target="_blank" title="View these observations" style="color:#74ac00; font-weight:bold;">%s</a>',
+          taxon_id, rv$link_param, n_user_obs
         )
-      )
+      ) %>%
+      rename(!!obs_col_name := obs_col)
 
     datatable(
       tbl,
