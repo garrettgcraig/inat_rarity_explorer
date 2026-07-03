@@ -16,7 +16,14 @@ library(dplyr)
 library(later)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-BASE_URL      <- "https://api.inaturalist.org/v1"
+# The v1 API ignores the `fields` parameter and always returns the full, fat
+# observation object (~42 KB each — comments, identifications, sounds, ancestry,
+# geojson, faves…). The v2 API honors an explicit field projection, so we ask
+# for only the 8 fields we use and get ~450 B per observation instead — a ~90×
+# reduction in bytes transferred AND JSON parsed on the single R thread. This is
+# the dominant performance lever for the whole app.
+BASE_URL      <- "https://api.inaturalist.org/v1"  # user autocomplete only
+BASE_URL_V2   <- "https://api.inaturalist.org/v2"  # observations + taxa
 COL_GREEN     <- "#74ac00"
 REQUEST_DELAY <- 0.08   # seconds between observation page fetches — be polite
 INAT_UA       <- "iNat Rarity Explorer (https://garrettgcraig.com)"
@@ -46,10 +53,13 @@ CONCURRENCY_PAGES   <- 4L    # pages of /observations fired in parallel
 CONCURRENCY_TAXA    <- 3L    # /taxa batches fired in parallel
 TAXA_BATCH_SIZE     <- 200L  # taxon IDs per /taxa call (was 30)
 
-# Fields filter: ask iNat to send only what we use. Smaller responses → faster
-# transfer AND less JSON to parse on the (single) R thread.
-OBS_FIELDS  <- "id,observed_on,place_guess,photos,taxon"
-TAXA_FIELDS <- "id,observations_count"
+# v2 field-projection strings. Syntax: (field:!t, nested:(sub:!t)). httr
+# percent-encodes these; iNat accepts the encoded form.
+OBS_FIELDS  <- paste0(
+  "(id:!t,observed_on:!t,place_guess:!t,photos:(url:!t),",
+  "taxon:(id:!t,name:!t,preferred_common_name:!t,iconic_taxon_name:!t))"
+)
+TAXA_FIELDS <- "(id:!t,observations_count:!t)"
 
 # Process-wide cache of global taxon observation counts. Survives across
 # sessions in the same R worker — repeat lookups for popular taxa are free.
@@ -139,12 +149,12 @@ build_obs_url <- function(username, page, per_page = 200L,
     qs$quality_grade <- quality_grade
   if (!is.null(d1)) qs$d1 <- d1
   if (!is.null(d2)) qs$d2 <- d2
-  modify_url(paste0(BASE_URL, "/observations"), query = qs)
+  modify_url(paste0(BASE_URL_V2, "/observations"), query = qs)
 }
 
 #' Build a /taxa URL for a batch of taxon IDs.
 build_taxa_url <- function(ids, per_page = TAXA_BATCH_SIZE) {
-  modify_url(paste0(BASE_URL, "/taxa"), query = list(
+  modify_url(paste0(BASE_URL_V2, "/taxa"), query = list(
     id       = paste(ids, collapse = ","),
     per_page = per_page,
     fields   = TAXA_FIELDS
@@ -592,9 +602,20 @@ ui <- dashboardPage(
           title = tags$span(icon("table"), "  Full Rarity Table — All Unique Taxa"),
           width = 12,
           div(
-            style = "margin-bottom:10px; font-size:13px; color:#6a8090;",
-            "Click any thumbnail to view the observation on iNaturalist. ",
-            "Table includes all ranked taxa; chart shows the top-N slider selection."
+            style = paste0("margin-bottom:10px; display:flex; gap:12px;",
+                           " align-items:center; justify-content:space-between;",
+                           " flex-wrap:wrap;"),
+            div(
+              style = "font-size:13px; color:#6a8090; flex:1 1 320px;",
+              "Click any thumbnail to view the observation on iNaturalist. ",
+              "Table includes all ranked taxa; chart shows the top-N slider selection."
+            ),
+            downloadButton(
+              "download_csv", "Download CSV",
+              style = paste0("background:", COL_GREEN, "; color:#fff;",
+                             " border-color:#5a8800; font-weight:600;",
+                             " border-radius:6px; white-space:nowrap;")
+            )
           ),
           withSpinner(
             DTOutput("rarity_table"),
@@ -659,55 +680,67 @@ server <- function(input, output, session) {
   }
 
   # ── Stage handlers ────────────────────────────────────────────────────────
-  step_verify <- function() {
-    ok <- tryCatch(check_user_exists(fs$username), error = function(e) FALSE)
-    if (!ok) {
-      finish_error(sprintf(
-        "User '%s' was not found on iNaturalist. Check the spelling and try again.",
-        fs$username))
-      return()
-    }
-    rv$status_msg <- "Counting observations..."
-    schedule(step_count)
-  }
-
+  # step_count fetches the FIRST page of observations, which also carries
+  # `total_results`. That folds three former round-trips (user-existence probe,
+  # a dedicated per_page=0 count, and page 1) into a single request on the happy
+  # path — page 1's data is data we need anyway. The user-existence check only
+  # runs (as a fallback, to give a precise error) when zero results come back.
   step_count <- function() {
-    q <- list(user_login = fs$username, per_page = 0)
-    if (fs$qg != "any") q$quality_grade <- fs$qg
-    resp <- safe_get(paste0(BASE_URL, "/observations"), q)
+    fs$per_page <- 200L
+    url  <- build_obs_url(fs$username, page = 1L, per_page = fs$per_page,
+                          quality_grade = fs$qg)
+    resp <- inat_multi_get_json(url, max_concurrent = 1L)[[1]]
     if (is.null(resp)) {
       finish_error("Could not connect to the iNaturalist API.")
       return()
     }
-    total <- as.integer(parse_resp(resp)$total_results %||% 0)
+    total <- as.integer(resp$total_results %||% 0)
     if (total == 0) {
-      finish_error(sprintf(
-        "No %sobservations found for '%s'.",
-        if (fs$qg == "research") "research-grade " else "", fs$username))
+      # Distinguish "no such user" from "user has no matching observations".
+      exists <- isTRUE(tryCatch(check_user_exists(fs$username),
+                                error = function(e) FALSE))
+      if (!exists) {
+        finish_error(sprintf(
+          "User '%s' was not found on iNaturalist. Check the spelling and try again.",
+          fs$username))
+      } else {
+        finish_error(sprintf(
+          "No %sobservations found for '%s'.",
+          if (fs$qg == "research") "research-grade " else "", fs$username))
+      }
       return()
     }
-    fs$total_obs   <- total
-    fs$per_page    <- 200L
-    fs$pages       <- list()
-    fs$n_so_far    <- 0L
-    fs$d1          <- NULL
-    fs$d2          <- NULL
+
+    fs$total_obs <- total
+    fs$pages     <- list()
+    fs$n_so_far  <- 0L
+    fs$d1        <- NULL
+    fs$d2        <- NULL
+
+    # Seed with page 1's results (already in hand from the request above).
+    results1 <- resp$results %||% list()
+    slimmed  <- Filter(Negate(is.null), lapply(results1, slim_obs))
+    if (length(slimmed) > 0L) {
+      fs$pages[[1L]] <- slimmed
+      fs$n_so_far    <- length(slimmed)
+    }
+    rv$status_msg <- sprintf("Fetched %s / %s observations...",
+                             format(fs$n_so_far, big.mark = ","),
+                             format(total, big.mark = ","))
 
     # iNat caps page-based pagination at page*per_page <= 10 000. For ≤10k
-    # accounts we use page-based pagination AND fire pages in parallel — fast.
-    # For >10k accounts we cursor with id_above (sequential, but unbounded).
+    # accounts we page (and fire pages in parallel). For >10k we cursor with
+    # id_above (sequential, but unbounded), seeded from page 1's max id.
     if (total <= 10000) {
-      fs$cur_page  <- 1L
-      fs$n_pages   <- ceiling(total / fs$per_page)
       fs$use_cursor <- FALSE
-      rv$status_msg <- sprintf("Fetching %s observations...",
-                               format(total, big.mark = ","))
+      fs$cur_page   <- 2L                      # page 1 already captured
+      fs$n_pages    <- ceiling(total / fs$per_page)
+      if (fs$cur_page > fs$n_pages) { schedule(step_parse); return() }
     } else {
-      fs$id_above   <- 0L
       fs$use_cursor <- TRUE
-      rv$status_msg <- sprintf(
-        "Fetching %s observations (cursor mode for large account)...",
-        format(total, big.mark = ","))
+      ids1 <- vapply(results1, function(o) as.integer(o$id %||% 0L), integer(1))
+      fs$id_above <- if (length(ids1)) max(ids1, na.rm = TRUE) else 0L
+      if (length(results1) < fs$per_page) { schedule(step_parse); return() }
     }
     schedule(step_fetch_page)
   }
@@ -890,15 +923,13 @@ server <- function(input, output, session) {
   }
 
   # ── Kick off ─────────────────────────────────────────────────────────────
-  observeEvent(input$fetch_btn, {
-
-    username <- trimws(input$username)
+  start_fetch <- function(username, qg) {
+    username <- trimws(username %||% "")
     if (!nzchar(username)) {
       showNotification("Please enter an iNaturalist username.", type = "warning")
-      return()
+      return(invisible())
     }
-
-    qg <- input$quality_grade
+    if (!qg %in% c("research", "any")) qg <- "research"
 
     # Reset cached data
     rv$rarity_df     <- NULL
@@ -917,7 +948,29 @@ server <- function(input, output, session) {
 
     disable("fetch_btn"); disable("username")
 
-    schedule(step_verify)
+    # Reflect the active query in the URL so results are shareable/bookmarkable.
+    updateQueryString(
+      sprintf("?user=%s&grade=%s", utils::URLencode(username, reserved = TRUE), qg),
+      mode = "replace")
+
+    schedule(step_count)
+  }
+
+  observeEvent(input$fetch_btn, {
+    start_fetch(input$username, input$quality_grade)
+  })
+
+  # Deep link: on first load, if the URL carries ?user=…, populate the sidebar
+  # controls and auto-run so a shared link reproduces someone's results.
+  observeEvent(session$clientData$url_search, once = TRUE, {
+    q <- getQueryString()
+    if (!is.null(q$user) && nzchar(q$user)) {
+      grade <- if (!is.null(q$grade) && q$grade %in% c("research", "any"))
+        q$grade else "research"
+      updateTextInput(session, "username", value = q$user)
+      updateRadioButtons(session, "quality_grade", selected = grade)
+      start_fetch(q$user, grade)
+    }
   })
 
 
@@ -1297,6 +1350,32 @@ server <- function(input, output, session) {
                handle_plotly_click("rarity_plot"))
   observeEvent(event_data("plotly_click", source = "rarity_scatter"),
                handle_plotly_click("rarity_scatter"))
+
+  # ── CSV export of the full ranked table ────────────────────────────────────
+  output$download_csv <- downloadHandler(
+    filename = function() {
+      sprintf("inat-rarest-%s-%s.csv",
+              gsub("[^A-Za-z0-9_-]", "", rv$username %||% "user"), Sys.Date())
+    },
+    content = function(file) {
+      df <- rv$rarity_df
+      req(df, nrow(df) > 0)
+      out <- df %>%
+        transmute(
+          rank,
+          common_name    = coalesce(common_name, ""),
+          scientific_name = coalesce(sci_name, ""),
+          taxon_id,
+          iconic_group   = coalesce(iconic, ""),
+          observed_on    = coalesce(obs_date, ""),
+          place          = coalesce(place, ""),
+          global_obs     = global_count,
+          your_obs       = n_user_obs,
+          observation_url = inat_url
+        )
+      utils::write.csv(out, file, row.names = FALSE, na = "")
+    }
+  )
 
   # ── DT rarity table ────────────────────────────────────────────────────────
   output$rarity_table <- renderDT({
