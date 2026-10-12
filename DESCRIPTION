@@ -18,8 +18,9 @@ Imports:
     jsonlite (>= 1.8.0),
     plotly (>= 4.10.0),
     DT (>= 0.28),
-    dplyr (>= 1.1.0)
+    dplyr (>= 1.1.0),
+    later (>= 1.3.0)
 
 SystemRequirements: R (>= 4.2.0), internet access to api.inaturalist.org
-URL: https://github.com/garrettgcraig/inat-rarity-explorer
-BugReports: https://github.com/garrettgcraig/inat-rarity-explorer/issues
+URL: https://github.com/garrettgcraig/inat_rarity_explorer
+BugReports: https://github.com/garrettgcraig/inat_rarity_explorer/issues

@@ -11,7 +11,8 @@ pkgs <- c(
   "jsonlite",
   "plotly",
   "DT",
-  "dplyr"
+  "dplyr",
+  "later"
 )
 
 missing_pkgs <- pkgs[!pkgs %in% rownames(installed.packages())]

@@ -22,8 +22,7 @@ library(later)
 # for only the 8 fields we use and get ~450 B per observation instead — a ~90×
 # reduction in bytes transferred AND JSON parsed on the single R thread. This is
 # the dominant performance lever for the whole app.
-BASE_URL      <- "https://api.inaturalist.org/v1"  # user autocomplete only
-BASE_URL_V2   <- "https://api.inaturalist.org/v2"  # observations + taxa
+BASE_URL_V2   <- "https://api.inaturalist.org/v2"  # all API requests
 COL_GREEN     <- "#74ac00"
 REQUEST_DELAY <- 0.08   # seconds between observation page fetches — be polite
 INAT_UA       <- "iNat Rarity Explorer (https://garrettgcraig.com)"
@@ -87,6 +86,13 @@ OBS_FIELDS  <- paste0(
   "taxon:(id:!t,name:!t,preferred_common_name:!t,iconic_taxon_name:!t))"
 )
 TAXA_FIELDS <- "(id:!t,observations_count:!t)"
+USER_FIELDS <- "(id:!t,login:!t,name:!t)"
+APP_URL <- "https://garrettgcraig.shinyapps.io/inat-rarest/"
+SEO_TITLE <- "iNaturalist Rarity Explorer | Find Your Rarest Observations"
+SEO_DESCRIPTION <- paste0(
+  "Find your rarest iNaturalist observations by worldwide observation count. ",
+  "Explore users or projects, compare species, and download ranked results."
+)
 
 # Process-wide cache of global taxon observation counts. Survives across
 # sessions in the same R worker — repeat lookups for popular taxa are free.
@@ -199,27 +205,63 @@ parse_resp <- function(resp) {
   )
 }
 
-#' Verify that a user login exists on iNaturalist
-check_user_exists <- function(username) {
-  resp <- safe_get(
-    paste0(BASE_URL, "/users/autocomplete"),
-    list(q = username)
-  )
-  if (is.null(resp)) return(FALSE)
-  parsed <- parse_resp(resp)
-  if (is.null(parsed) || length(parsed$results) == 0) return(FALSE)
-  any(sapply(parsed$results, function(u) {
-    tolower(chr_val(u$login)) == tolower(username)
-  }))
+#' Accept a login, @login, or an iNaturalist profile URL. Display names remain
+#' search text until the user explicitly chooses a suggestion.
+normalize_user_query <- function(value) {
+  value <- trimws(value %||% "")
+  profile <- "^https?://(www\\.)?inaturalist\\.org/(people|users)/([^/?#]+)/*([?#].*)?$"
+  if (grepl(profile, value, ignore.case = TRUE)) {
+    value <- utils::URLdecode(sub(profile, "\\3", value, ignore.case = TRUE))
+  }
+  trimws(sub("^@", "", value))
 }
 
-#' Resolve a project name to its numeric id via the autocomplete endpoint.
+#' Search logins AND display names. NULL means unavailable, list() no matches.
+search_users <- function(query) {
+  query <- normalize_user_query(query)
+  if (nchar(query) < 2L) return(list())
+  resp <- safe_get(paste0(BASE_URL_V2, "/users/autocomplete"),
+                   list(q = tolower(query), per_page = 8L, fields = USER_FIELDS),
+                   retries = 1L, timeout_secs = 5)
+  parsed <- parse_resp(resp)
+  if (is.null(parsed) || !is.list(parsed$results)) return(NULL)
+  users <- Filter(function(u) {
+    login <- chr_val(u$login)
+    !is.na(login) && nzchar(login)
+  }, parsed$results)
+  # Preserve iNat's ranking, but ensure the exact login stays first.
+  exact <- vapply(users, function(u) tolower(u$login) == tolower(query), logical(1))
+  head(users[order(!exact)], 8L)
+}
+
+#' Check the exact user endpoint; a failed request is not proof of absence.
+check_user_exists <- function(username) {
+  resp <- tryCatch(
+    GET(paste0(BASE_URL_V2, "/users/",
+               utils::URLencode(tolower(username), reserved = TRUE)),
+        query = list(fields = USER_FIELDS), timeout(5)),
+    error = function(e) NULL
+  )
+  if (is.null(resp)) return(NA)
+  if (status_code(resp) == 404L) return(FALSE)
+  if (status_code(resp) != 200L) return(NA)
+  parsed <- parse_resp(resp)
+  if (is.null(parsed) || !is.list(parsed$results) || length(parsed$results) == 0L)
+    return(NA)
+  any(vapply(parsed$results, function(u) {
+    tolower(chr_val(u$login)) == tolower(username)
+  }, logical(1)))
+}
+
+#' Resolve a project name to its numeric id via v2's project search.
 #' Returns list(id, title) for the best match, or NULL if none found.
 resolve_project <- function(name) {
-  resp <- safe_get(paste0(BASE_URL, "/projects/autocomplete"), list(q = name))
+  resp <- safe_get(paste0(BASE_URL_V2, "/search"),
+                   list(q = name, sources = "projects", per_page = 1L,
+                        fields = "(type:!t,project:(id:!t,title:!t))"))
   parsed <- parse_resp(resp)
   if (is.null(parsed) || length(parsed$results) == 0) return(NULL)
-  r <- parsed$results[[1]]
+  r <- parsed$results[[1]]$project
   if (is.null(r$id)) return(NULL)
   list(id = as.character(r$id), title = chr_val(r$title) %||% name)
 }
@@ -540,7 +582,7 @@ dark_css <- '
   .welcome-box {
     text-align: center; padding: 60px 30px; color: #6a8090;
   }
-  .welcome-box h2 { color: %1$s; font-size: 30px; margin-bottom: 14px; }
+  .welcome-box h1 { color: %1$s; font-size: 30px; margin-bottom: 14px; }
   .welcome-box p  { font-size: 15px; max-width: 560px; margin: 0 auto 10px; line-height: 1.7; }
 
   /* Sidebar stats */
@@ -555,8 +597,23 @@ dark_css <- gsub("%1$s", COL_GREEN, dark_css, fixed = TRUE)
 dark_css <- gsub("%%",   "%",       dark_css, fixed = TRUE)
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
+welcome_content <- div(
+  class = "welcome-box",
+  tags$h1("iNaturalist Rarity Explorer", style = "font-size:28px;"),
+  tags$p("Find your rarest iNaturalist observations, ranked by each taxon's ",
+         "worldwide observation count. Explore a user's observations or an entire project's ",
+         "with interactive charts, species photos, filters, and a downloadable CSV."),
+  tags$p(tags$small(
+    "Search for a user or project in the sidebar and click ", tags$b("Find My Rarest"),
+    ". Research-grade observations are selected by default. No sign-in is required.")),
+  tags$p(tags$small(
+    "Fewer iNaturalist observations do not necessarily mean a species is threatened ",
+    "or has a small population. These rankings measure how often taxa have been recorded on iNaturalist."))
+)
+
 ui <- dashboardPage(
   skin = "black",
+  title = SEO_TITLE,
 
   dashboardHeader(
     title     = "🌿 iNat Rarity Explorer",
@@ -587,7 +644,9 @@ ui <- dashboardPage(
         ),
         div(style = "margin-top:5px; margin-bottom:14px;",
           textInput("username", NULL,
-                    placeholder = "e.g. hommedeterre", width = "100%")
+                    placeholder = "Username, name, or profile link", width = "100%"),
+          tags$small("Type at least 2 characters. Choose a match when searching by name."),
+          div(`aria-live` = "polite", uiOutput("user_suggestions"))
         )
       ),
 
@@ -683,9 +742,30 @@ ui <- dashboardPage(
 
   dashboardBody(
     useShinyjs(),
-    tags$head(tags$style(HTML(dark_css))),
+    tags$head(
+      tags$style(HTML(dark_css)),
+      tags$meta(name = "description", content = SEO_DESCRIPTION),
+      tags$link(rel = "canonical", href = APP_URL),
+      tags$meta(property = "og:type", content = "website"),
+      tags$meta(property = "og:site_name", content = "iNaturalist Rarity Explorer"),
+      tags$meta(property = "og:title", content = SEO_TITLE),
+      tags$meta(property = "og:description", content = SEO_DESCRIPTION),
+      tags$meta(property = "og:url", content = APP_URL),
+      tags$meta(name = "twitter:card", content = "summary"),
+      tags$meta(name = "twitter:title", content = SEO_TITLE),
+      tags$meta(name = "twitter:description", content = SEO_DESCRIPTION),
+      tags$script(type = "application/ld+json", HTML(toJSON(list(
+        `@context` = "https://schema.org", `@type` = "WebApplication",
+        name = "iNaturalist Rarity Explorer", url = APP_URL,
+        description = SEO_DESCRIPTION, applicationCategory = "EducationalApplication",
+        operatingSystem = "Any", browserRequirements = "Requires JavaScript",
+        isAccessibleForFree = TRUE
+      ), auto_unbox = TRUE)))
+    ),
 
-    fluidRow(column(12, uiOutput("status_panel"))),
+    # Include useful copy in the initial HTML, before a WebSocket connects.
+    fluidRow(column(12, uiOutput("status_panel",
+      container = function(...) div(..., welcome_content)))),
 
     conditionalPanel(
       condition = "output.has_data",
@@ -785,6 +865,48 @@ server <- function(input, output, session) {
     error_msg     = ""
   )
 
+  # Session-only suggestions. Debounce typing, and never show or select results
+  # belonging to an older query. Selection fills the login; it does not fetch.
+  user_matches <- reactiveValues(query = "", users = list(), unavailable = FALSE,
+                                 selected = NULL)
+  user_query <- debounce(reactive(normalize_user_query(input$username)), 450)
+  observeEvent(user_query(), {
+    query <- user_query()
+    if (!identical(input$search_mode, "user") || identical(rv$status, "fetching")) return()
+    if (identical(query, user_matches$selected)) return()
+    users <- search_users(query)
+    user_matches$query <- query
+    user_matches$users <- users %||% list()
+    user_matches$unavailable <- is.null(users)
+  }, ignoreNULL = FALSE)
+
+  output$user_suggestions <- renderUI({
+    query <- normalize_user_query(input$username)
+    if (nchar(query) < 2L || !identical(query, user_matches$query) ||
+        identical(query, user_matches$selected) || identical(rv$status, "fetching")) return(NULL)
+    if (user_matches$unavailable) return(tags$p(
+      "Suggestions unavailable. Enter your full username and try again.", role = "status"))
+    if (!length(user_matches$users)) return(tags$p("No matching users.", role = "status"))
+    tagList(lapply(seq_along(user_matches$users), function(i) {
+      u <- user_matches$users[[i]]
+      name <- chr_val(u$name)
+      label <- if (!is.na(name) && nzchar(name))
+        paste0("@", u$login, " — ", name) else paste0("@", u$login)
+      actionButton(paste0("user_pick_", i), label,
+                   style = "display:block; width:100%; text-align:left; white-space:normal; margin-top:5px;")
+    }))
+  })
+  lapply(seq_len(8L), function(i) {
+    observeEvent(input[[paste0("user_pick_", i)]], {
+      if (identical(rv$status, "fetching") ||
+          !identical(normalize_user_query(input$username), user_matches$query) ||
+          length(user_matches$users) < i) return()
+      login <- user_matches$users[[i]]$login
+      user_matches$selected <- login
+      updateTextInput(session, "username", value = login)
+    }, ignoreInit = TRUE)
+  })
+
   # ── Fetch state machine ───────────────────────────────────────────────────
   #
   # Why a state machine: shinyapps.io's WebSocket disconnects if the R thread
@@ -870,11 +992,12 @@ server <- function(input, output, session) {
           if (fs$qg == "research") "research-grade " else "", fs$subject_label))
       } else {
         # Distinguish "no such user" from "user has no matching observations".
-        exists <- isTRUE(tryCatch(check_user_exists(fs$subject),
-                                  error = function(e) FALSE))
-        if (!exists) {
+        exists <- tryCatch(check_user_exists(fs$subject), error = function(e) NA)
+        if (is.na(exists)) {
+          finish_error("Could not verify this username with iNaturalist. Please try again.")
+        } else if (!exists) {
           finish_error(sprintf(
-            "User '%s' was not found on iNaturalist. Check the spelling and try again.",
+            "User '%s' was not found on iNaturalist. Check the spelling or choose a suggested user.",
             fs$subject))
         } else {
           finish_error(sprintf(
@@ -1109,6 +1232,7 @@ server <- function(input, output, session) {
   start_fetch <- function(subject, qg, mode = "user") {
     subject <- trimws(subject %||% "")
     if (!mode %in% c("user", "project")) mode <- "user"
+    if (mode == "user") subject <- tolower(normalize_user_query(subject))
     if (!nzchar(subject)) {
       showNotification(
         if (mode == "project") "Please enter a project name."
@@ -1116,6 +1240,12 @@ server <- function(input, output, session) {
         type = "warning")
       return(invisible())
     }
+    if (mode == "user" && !grepl("^[a-z0-9_][a-z0-9_.-]*$", subject)) {
+      showNotification("Choose a suggested user, or enter their full iNaturalist username.",
+                       type = "warning")
+      return(invisible())
+    }
+    if (mode == "user") updateTextInput(session, "username", value = subject)
     if (!qg %in% c("research", "any")) qg <- "research"
 
     # Reset cached data
@@ -1255,23 +1385,7 @@ server <- function(input, output, session) {
   # ── Status panel ───────────────────────────────────────────────────────────
   output$status_panel <- renderUI({
     switch(rv$status,
-      idle = div(
-        class = "welcome-box",
-        tags$h2("🌿 iNat Rarity Explorer"),
-        tags$p(
-          "Find out which iNaturalist observations are the rarest on Earth, ",
-          "ranked by how few people have ever recorded that species globally. ",
-          "Explore a single user's finds or an entire project's."
-        ),
-        tags$p(tags$small(
-          style = "color:#455060;",
-          "Pick ", tags$b("a user"), " or ", tags$b("a project"),
-          " in the sidebar, enter a name, and click ",
-          tags$b("Find My Rarest"), " to begin.",
-          tags$br(),
-          "Large accounts or projects (1000+ taxa) may take a little longer."
-        ))
-      ),
+      idle = welcome_content,
       fetching = div(
         class = "msg-info",
         icon("spinner", class = "fa-spin"), " ", rv$status_msg
