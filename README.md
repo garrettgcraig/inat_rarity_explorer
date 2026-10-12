@@ -8,7 +8,7 @@ A Shiny dashboard that lets you enter any iNaturalist username and discover whic
 
 ## Features
 
-- **Username lookup** — enter any iNaturalist login and fetch all research-grade observations
+- **Smart user lookup** — search usernames or display names with debounced, selectable suggestions; paste an `@username` or iNaturalist profile link, then fetch observations
 - **10 k cap bypass** — users with more than 10,000 observations are handled automatically via year-by-year date-range chunking
 - **Global rarity ranking** — each unique taxon's total worldwide observation count is fetched from the iNaturalist API
 - **Interactive lollipop chart** — plotly chart of the top-N rarest taxa, with optional log scale
@@ -49,7 +49,7 @@ shiny::runApp()
 ## Usage
 
 1. Open the app in your browser.
-2. Type an iNaturalist username (e.g. `hommedeterre`) into the sidebar text box.
+2. Type an iNaturalist username or display name into the sidebar text box. Suggestions appear after at least two characters; select the intended account. A full username, `@username`, or `https://www.inaturalist.org/people/username` profile link also works directly. Names and partial matches are never automatically assigned to an account.
 3. Click **Find My Rarest**.
 4. Wait while the app fetches observations and looks up global counts — a progress bar tracks each step.
 5. Explore the lollipop chart and sortable table. Use the slider to change how many species appear in the chart.
@@ -60,17 +60,24 @@ shiny::runApp()
 
 ## API Details
 
-All data comes from the public [iNaturalist API v1](https://api.inaturalist.org/v1/docs/):
+All requests use the public [iNaturalist API v2](https://api.inaturalist.org/v2/docs/), with explicit field projections:
 
 | Purpose | Endpoint |
 |---|---|
-| Count user observations | `GET /observations?user_login=X&quality_grade=research&per_page=0` |
-| Fetch observation pages | `GET /observations?user_login=X&quality_grade=research&per_page=200&page=N` |
-| Date-range chunk | Add `d1=YYYY-01-01&d2=YYYY-12-31` to above |
-| Global taxon count | `GET /observations?taxon_id=X&per_page=0` → `total_results` |
-| Verify username | `GET /users/autocomplete?q=X` |
+| Count and fetch user observations | `GET /observations?user_login=X&quality_grade=research&per_page=200&page=1` → `total_results` and first page |
+| Fetch subsequent observation pages | Same endpoint with `page=N` or `id_above=ID` |
+| Global taxon counts | `GET /taxa?id=ID1,ID2,...` → each taxon's `observations_count` |
+| Suggest users by login or display name | `GET /users/autocomplete?q=X&per_page=8&fields=(id:!t,login:!t,name:!t)` |
+| Verify exact username when no observations match | `GET /users/X?fields=(id:!t,login:!t,name:!t)` |
+| Resolve project name | `GET /search?q=X&sources=projects&per_page=1&fields=(type:!t,project:(id:!t,title:!t))` |
 
 No API key is required.
+
+User suggestions are kept only in the current Shiny session, use a 450 ms typing debounce, and request only account ID, login, and display name. Failed lookups are reported separately from nonexistent users or users with no matching observations.
+
+## Validation
+
+Run `Rscript tests/user-lookup.R` from the repository root to exercise input normalization, v2 request construction, exact-login ordering, unavailable/empty lookups, suggestion selection, stale clicks, and fetch error handling without network calls.
 
 ---
 
