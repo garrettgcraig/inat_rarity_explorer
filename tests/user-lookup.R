@@ -3,6 +3,14 @@
 exprs <- parse("app.R")
 invisible(lapply(exprs[-length(exprs)], eval, envir = globalenv()))
 
+initial_html <- htmltools::renderTags(ui)
+stopifnot(grepl(SEO_TITLE, initial_html$head, fixed = TRUE),
+          grepl("iNaturalist Rarity Explorer</h1>", initial_html$html, fixed = TRUE),
+          grepl('name="description"', initial_html$head, fixed = TRUE),
+          grepl(paste0('rel="canonical" href="', APP_URL, '"'), initial_html$head, fixed = TRUE),
+          grepl('property="og:title"', initial_html$head, fixed = TRUE),
+          grepl('application/ld+json', initial_html$head, fixed = TRUE))
+
 stopifnot(
   identical(normalize_user_query(" @Kueda "), "Kueda"),
   identical(normalize_user_query("https://www.inaturalist.org/people/kueda/?tab=about"), "kueda"),

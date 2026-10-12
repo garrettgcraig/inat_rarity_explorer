@@ -1,116 +1,95 @@
-# 🌿 iNat Rarity Explorer
+# iNaturalist Rarity Explorer — Find Your Rarest Observations
 
-A Shiny dashboard that lets you enter any iNaturalist username and discover which of their research-grade observations are the **rarest in the world** — ranked by global observation count across all of iNaturalist.
+Discover your rarest iNaturalist observations with a free, open-source R Shiny dashboard. Search an iNaturalist user or project, then rank observed taxa by their **worldwide iNaturalist observation count**.
 
-![Dark theme dashboard with lollipop chart and data table](https://www.inaturalist.org/assets/inat-social-media-default.png)
+**[Launch iNaturalist Rarity Explorer](https://garrettgcraig.shinyapps.io/inat-rarest/)** · [Report an issue](https://github.com/garrettgcraig/inat_rarity_explorer/issues)
 
----
+## What does “rare” mean here?
+
+A taxon with fewer observations on iNaturalist ranks above a taxon with more observations. This measures how frequently a taxon has been recorded on the platform; it does **not** measure population size, conservation status, or the number of distinct observers. Coverage varies by location, season, identification difficulty, and observer activity.
 
 ## Features
 
-- **Smart user lookup** — search usernames or display names with debounced, selectable suggestions; paste an `@username` or iNaturalist profile link, then fetch observations
-- **10 k cap bypass** — users with more than 10,000 observations are handled automatically via year-by-year date-range chunking
-- **Global rarity ranking** — each unique taxon's total worldwide observation count is fetched from the iNaturalist API
-- **Interactive lollipop chart** — plotly chart of the top-N rarest taxa, with optional log scale
-- **Sortable data table** — full ranked table with photo thumbnails, common & scientific names, date, place, and global count
-- **Session caching** — re-adjusting the top-N slider or log-scale toggle never re-fetches data
-- **Progress feedback** — step-by-step progress bar during both the observation fetch and global-count lookup phases
-- **Graceful error handling** — user-facing messages for bad usernames, network errors, and empty results
+- **Smart user search:** find accounts by username or display name, select a suggestion, or paste an `@username` or iNaturalist profile link.
+- **User and project exploration:** analyze an account's observations or search an iNaturalist project by name.
+- **Quality-grade selection:** research-grade observations by default, with an option to include all quality grades.
+- **Global observation-count rankings:** a trophy case, interactive charts, and a sortable table with species photos, scientific/common names, observation dates, and places.
+- **Filters and CSV export:** filter by kingdom, animal class, common-name availability, and observation place; export the filtered table.
+- **Large-account support:** switch to observation-ID cursor pagination beyond iNaturalist's 10,000-result page limit.
+- **Session caching and progress:** changing chart controls reuses fetched data; progress messages track loading.
+- **iNaturalist API v2:** explicit field projections and batched taxon-count requests reduce transferred data.
 
----
+## How to use it
 
-## Quick Start
+1. [Open the explorer](https://garrettgcraig.shinyapps.io/inat-rarest/).
+2. Choose a user's observations or a project's observations.
+3. For users, type at least two characters of a username or display name and select the intended account. A full login, `@login`, or `https://www.inaturalist.org/people/login` also works directly. Display names and partial matches are never automatically assigned to an account.
+4. Choose the quality grade and click **Find My Rarest**.
+5. Explore the ranked results, adjust filters, and download a CSV if needed.
 
-### 1. Install dependencies
+No iNaturalist sign-in or API key is required. The app reads public observations; it does not post or modify observations. Large accounts and projects can take longer to load.
+
+## Run locally
+
+Requires R ≥ 4.2 and internet access to `api.inaturalist.org`.
 
 ```r
 source("install_packages.R")
-```
-
-Or manually:
-
-```r
-install.packages(c(
-  "shiny", "shinydashboard", "shinyjs", "shinycssloaders",
-  "httr", "jsonlite", "plotly", "DT", "dplyr"
-))
-```
-
-### 2. Run the app
-
-```r
-shiny::runApp("app.R")
-# or, from within the folder:
 shiny::runApp()
 ```
 
----
+Dependencies: `shiny`, `shinydashboard`, `shinyjs`, `shinycssloaders`, `httr`, `jsonlite`, `plotly`, `DT`, `dplyr`, and `later`. The installer and `DESCRIPTION` list the runtime requirements.
 
-## Usage
+## API requests
 
-1. Open the app in your browser.
-2. Type an iNaturalist username or display name into the sidebar text box. Suggestions appear after at least two characters; select the intended account. A full username, `@username`, or `https://www.inaturalist.org/people/username` profile link also works directly. Names and partial matches are never automatically assigned to an account.
-3. Click **Find My Rarest**.
-4. Wait while the app fetches observations and looks up global counts — a progress bar tracks each step.
-5. Explore the lollipop chart and sortable table. Use the slider to change how many species appear in the chart.
-
-> **Note:** The global-count lookup makes one API call per unique taxon. At ~12 calls/second this is polite to the iNaturalist API. For an account with 500 unique taxa, expect ~45 seconds for the lookup phase.
-
----
-
-## API Details
-
-All requests use the public [iNaturalist API v2](https://api.inaturalist.org/v2/docs/), with explicit field projections:
+All application requests use the public [iNaturalist API v2](https://api.inaturalist.org/v2/docs/) with explicit field projections.
 
 | Purpose | Endpoint |
-|---|---|
-| Count and fetch user observations | `GET /observations?user_login=X&quality_grade=research&per_page=200&page=1` → `total_results` and first page |
-| Fetch subsequent observation pages | Same endpoint with `page=N` or `id_above=ID` |
-| Global taxon counts | `GET /taxa?id=ID1,ID2,...` → each taxon's `observations_count` |
-| Suggest users by login or display name | `GET /users/autocomplete?q=X&per_page=8&fields=(id:!t,login:!t,name:!t)` |
-| Verify exact username when no observations match | `GET /users/X?fields=(id:!t,login:!t,name:!t)` |
-| Resolve project name | `GET /search?q=X&sources=projects&per_page=1&fields=(type:!t,project:(id:!t,title:!t))` |
+| --- | --- |
+| Count and fetch observations | `/observations` with `user_login` or `project_id`, quality grade, and projected observation fields |
+| Fetch beyond the page limit | `/observations` with an `id_above` cursor |
+| Batch worldwide taxon counts | `/taxa?id=ID1,ID2,...` with `id` and `observations_count` |
+| Suggest users by login or display name | `/users/autocomplete?q=X&per_page=8` with `id`, `login`, and `name` |
+| Verify exact username when no observations match | `/users/X` with the same minimal user fields |
+| Resolve a project name | `/search?q=X&sources=projects&per_page=1` with projected project `id` and `title` |
 
-No API key is required.
-
-User suggestions are kept only in the current Shiny session, use a 450 ms typing debounce, and request only account ID, login, and display name. Failed lookups are reported separately from nonexistent users or users with no matching observations.
+User suggestions stay in the current Shiny session, use a 450 ms typing debounce, and request only account ID, login, and display name. API failures are reported separately from nonexistent users and users with no matching observations.
 
 ## Validation
 
-Run `Rscript tests/user-lookup.R` from the repository root to exercise input normalization, v2 request construction, exact-login ordering, unavailable/empty lookups, suggestion selection, stale clicks, and fetch error handling without network calls.
-
----
-
-## File Structure
-
-```
-inat-rarest/
-├── app.R               # Single-file Shiny application
-├── install_packages.R  # One-time package installer
-├── DESCRIPTION         # Dependency manifest
-└── README.md           # This file
+```sh
+Rscript tests/user-lookup.R
 ```
 
----
+Offline helper and Shiny interaction checks cover input normalization, v2 requests, exact-login ordering, empty/unavailable lookups, suggestion selection, stale clicks, and fetch error handling. Static HTML checks verify search metadata and introductory content before a WebSocket session starts.
 
-## Dependencies
+## Deployment and search metadata
 
-| Package | Role |
-|---|---|
-| `shiny` | Web application framework |
-| `shinydashboard` | Dashboard layout |
-| `shinyjs` | Enable/disable UI elements |
-| `shinycssloaders` | Spinner overlays |
-| `httr` | HTTP requests to iNaturalist API |
-| `jsonlite` | JSON parsing |
-| `plotly` | Interactive lollipop chart |
-| `DT` | Interactive data table |
-| `dplyr` | Data manipulation |
+The existing production app is `inat-rarest` on the `garrettgcraig` shinyapps.io account. Deploy only the runtime files; keep hosting records and credentials out of Git.
 
-Requires **R ≥ 4.2** and internet access to `api.inaturalist.org`.
+```r
+rsconnect::deployApp(
+  appFiles = c("app.R", "DESCRIPTION"),
+  appId = "17348267",
+  appName = "inat-rarest",
+  account = "garrettgcraig",
+  server = "shinyapps.io",
+  launch.browser = FALSE
+)
+```
 
----
+The app's initial HTML contains a descriptive page title, meta description, canonical production URL, Open Graph/Twitter metadata, WebApplication JSON-LD, and introductory text. Shared `?user=` and `?project=` links remain functional, while canonical metadata points to the main app URL. Metadata improves discoverability and link descriptions; indexing and rankings depend on search engines.
+
+## Repository contents
+
+| Path | Purpose |
+| --- | --- |
+| `app.R` | Shiny UI, API helpers, and server |
+| `DESCRIPTION` | Runtime dependency manifest |
+| `install_packages.R` | Local package installer |
+| `tests/user-lookup.R` | Offline regression checks |
+| `CHANGELOG.md` | Change and release status |
 
 ## License
 
-MIT © Garrett Craig
+MIT © Garrett Craig. Observation data and photos retain their source licenses; the repository's code license does not relicense iNaturalist content.

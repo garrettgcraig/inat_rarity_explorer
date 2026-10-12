@@ -87,6 +87,12 @@ OBS_FIELDS  <- paste0(
 )
 TAXA_FIELDS <- "(id:!t,observations_count:!t)"
 USER_FIELDS <- "(id:!t,login:!t,name:!t)"
+APP_URL <- "https://garrettgcraig.shinyapps.io/inat-rarest/"
+SEO_TITLE <- "iNaturalist Rarity Explorer | Find Your Rarest Observations"
+SEO_DESCRIPTION <- paste0(
+  "Find your rarest iNaturalist observations by worldwide observation count. ",
+  "Explore users or projects, compare species, and download ranked results."
+)
 
 # Process-wide cache of global taxon observation counts. Survives across
 # sessions in the same R worker — repeat lookups for popular taxa are free.
@@ -576,7 +582,7 @@ dark_css <- '
   .welcome-box {
     text-align: center; padding: 60px 30px; color: #6a8090;
   }
-  .welcome-box h2 { color: %1$s; font-size: 30px; margin-bottom: 14px; }
+  .welcome-box h1 { color: %1$s; font-size: 30px; margin-bottom: 14px; }
   .welcome-box p  { font-size: 15px; max-width: 560px; margin: 0 auto 10px; line-height: 1.7; }
 
   /* Sidebar stats */
@@ -591,8 +597,23 @@ dark_css <- gsub("%1$s", COL_GREEN, dark_css, fixed = TRUE)
 dark_css <- gsub("%%",   "%",       dark_css, fixed = TRUE)
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
+welcome_content <- div(
+  class = "welcome-box",
+  tags$h1("iNaturalist Rarity Explorer", style = "font-size:28px;"),
+  tags$p("Find your rarest iNaturalist observations, ranked by each taxon's ",
+         "worldwide observation count. Explore a user's observations or an entire project's ",
+         "with interactive charts, species photos, filters, and a downloadable CSV."),
+  tags$p(tags$small(
+    "Search for a user or project in the sidebar and click ", tags$b("Find My Rarest"),
+    ". Research-grade observations are selected by default. No sign-in is required.")),
+  tags$p(tags$small(
+    "Fewer iNaturalist observations do not necessarily mean a species is threatened ",
+    "or has a small population. These rankings measure how often taxa have been recorded on iNaturalist."))
+)
+
 ui <- dashboardPage(
   skin = "black",
+  title = SEO_TITLE,
 
   dashboardHeader(
     title     = "🌿 iNat Rarity Explorer",
@@ -721,9 +742,30 @@ ui <- dashboardPage(
 
   dashboardBody(
     useShinyjs(),
-    tags$head(tags$style(HTML(dark_css))),
+    tags$head(
+      tags$style(HTML(dark_css)),
+      tags$meta(name = "description", content = SEO_DESCRIPTION),
+      tags$link(rel = "canonical", href = APP_URL),
+      tags$meta(property = "og:type", content = "website"),
+      tags$meta(property = "og:site_name", content = "iNaturalist Rarity Explorer"),
+      tags$meta(property = "og:title", content = SEO_TITLE),
+      tags$meta(property = "og:description", content = SEO_DESCRIPTION),
+      tags$meta(property = "og:url", content = APP_URL),
+      tags$meta(name = "twitter:card", content = "summary"),
+      tags$meta(name = "twitter:title", content = SEO_TITLE),
+      tags$meta(name = "twitter:description", content = SEO_DESCRIPTION),
+      tags$script(type = "application/ld+json", HTML(toJSON(list(
+        `@context` = "https://schema.org", `@type` = "WebApplication",
+        name = "iNaturalist Rarity Explorer", url = APP_URL,
+        description = SEO_DESCRIPTION, applicationCategory = "EducationalApplication",
+        operatingSystem = "Any", browserRequirements = "Requires JavaScript",
+        isAccessibleForFree = TRUE
+      ), auto_unbox = TRUE)))
+    ),
 
-    fluidRow(column(12, uiOutput("status_panel"))),
+    # Include useful copy in the initial HTML, before a WebSocket connects.
+    fluidRow(column(12, uiOutput("status_panel",
+      container = function(...) div(..., welcome_content)))),
 
     conditionalPanel(
       condition = "output.has_data",
@@ -1343,23 +1385,7 @@ server <- function(input, output, session) {
   # ── Status panel ───────────────────────────────────────────────────────────
   output$status_panel <- renderUI({
     switch(rv$status,
-      idle = div(
-        class = "welcome-box",
-        tags$h2("🌿 iNat Rarity Explorer"),
-        tags$p(
-          "Find out which iNaturalist observations are the rarest on Earth, ",
-          "ranked by how few people have ever recorded that species globally. ",
-          "Explore a single user's finds or an entire project's."
-        ),
-        tags$p(tags$small(
-          style = "color:#455060;",
-          "Pick ", tags$b("a user"), " or ", tags$b("a project"),
-          " in the sidebar, enter a name, and click ",
-          tags$b("Find My Rarest"), " to begin.",
-          tags$br(),
-          "Large accounts or projects (1000+ taxa) may take a little longer."
-        ))
-      ),
+      idle = welcome_content,
       fetching = div(
         class = "msg-info",
         icon("spinner", class = "fa-spin"), " ", rv$status_msg
